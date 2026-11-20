@@ -31,6 +31,75 @@ class TestHiSparseDecodeRemap(CustomTestCase):
         self.assertEqual(allocator.request_slot_reserve(has_req_pool_slot=False), 1024)
         self.assertEqual(allocator.request_slot_reserve(has_req_pool_slot=True), 0)
 
+    def test_buffered_prompt_host_rows_are_charged_under_exclusive_placement(self):
+        """A prompt that stays buffered holds host slots besides its device slots."""
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 64
+        allocator.configure_spec_scratch(0)
+
+        def reserve(prefill_tokens, has_req_pool_slot=False):
+            return allocator.request_slot_reserve(
+                has_req_pool_slot=has_req_pool_slot, prefill_tokens=prefill_tokens
+            )
+
+        self.assertEqual(reserve(1000), 0)
+        allocator._buffered_prompt_tokens = 12288
+        self.assertEqual(reserve(1000), 1024)
+        self.assertEqual(reserve(20000), 0)
+        # It took its host rows with its request slot.
+        self.assertEqual(reserve(1000, has_req_pool_slot=True), 0)
+
+    def test_paged_pool_budget_marks_a_refusal_no_wait_can_lift(self):
+        """With paged residency a request refused while no request holds logical
+        slots is unschedulable; without it the allocator keeps the plain budget."""
+        from sglang.srt.mem_cache.prefill_budget import (
+            HiSparsePagedPrefillBudget,
+            PrefillBudget,
+        )
+
+        logical_free = [6400]
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 64
+        allocator._size_full = 6400
+        allocator._hs_el = None
+        allocator.logical_attn_allocator = SimpleNamespace(
+            available_size=lambda: logical_free[0], num_pages=100
+        )
+        allocator.hisparse_attn_allocator = SimpleNamespace(available_size=lambda: 1280)
+        tree_cache = SimpleNamespace(
+            supports_mamba=lambda: False, evictable_size=lambda: 0
+        )
+        self.assertIs(type(allocator.create_prefill_budget(tree_cache)), PrefillBudget)
+
+        allocator._reclaimer = SimpleNamespace(
+            hs_exclusive=False, reclaimable_slots=lambda: 0
+        )
+        budget = allocator.create_prefill_budget(tree_cache)
+        self.assertIsInstance(budget, HiSparsePagedPrefillBudget)
+
+        def fits(paged_input):
+            return budget.can_allocate_prefill(
+                paged_input=paged_input,
+                extend_input_len=paged_input,
+                max_new_tokens=0,
+                chunk_limit=None,
+            )
+
+        self.assertTrue(fits(1280))
+        self.assertFalse(budget.unschedulable)
+        # Larger than the device pool, and nothing will give memory back.
+        self.assertFalse(fits(1344))
+        self.assertTrue(budget.unschedulable)
+        # A request holds slots: the refused one waits for it.
+        logical_free[0] = 6336
+        self.assertFalse(fits(1344))
+        self.assertFalse(budget.unschedulable)
+        # A request admitted earlier in the same pass will hold memory.
+        logical_free[0] = 6400
+        budget.total_offset = 64
+        self.assertFalse(fits(1344))
+        self.assertFalse(budget.unschedulable)
+
     def test_page_size_one_reclaims_temporary_device_slot(self):
         """Decode remapping must reclaim its temporary slot without freeing the live slot."""
         from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator

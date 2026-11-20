@@ -148,7 +148,8 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     if _is_npu and memory_config.enable_hierarchical_cache:
         return False
     return (
-        not memory_config.enable_hisparse
+        # Paged residency keeps index keys for the indexer layers only.
+        (not memory_config.enable_hisparse or envs.SGLANG_HISPARSE_PAGED.get())
         and not is_draft_worker
         and not memory_config.enable_unified_cache_external_linker
     )

@@ -310,6 +310,32 @@ class PrefillBudget:
         self.current_offset += immediate
 
 
+class HiSparsePagedPrefillBudget(PrefillBudget):
+    """Paged HiSparse pool. A prompt is prefilled in the device pool, so a request
+    refused while no request holds pool memory can never be admitted: it is
+    unschedulable (the scheduler aborts it) instead of queued forever."""
+
+    def _verdict(self, fits: bool) -> bool:
+        self.unschedulable = (
+            not fits
+            and self.total_offset == 0
+            and not self.allocator.holds_request_tokens()
+        )
+        return fits
+
+    def check_prefill(self, **request) -> tuple[bool, int | None]:
+        can_admit, chunk_limit = super().check_prefill(**request)
+        return self._verdict(can_admit), chunk_limit
+
+    def can_allocate_prefill(self, **request) -> bool:
+        return self._verdict(super().can_allocate_prefill(**request))
+
+    def ignore_eos_decode_fits(
+        self, req_states: Sequence[Tuple[float, int]], **request
+    ) -> bool:
+        return self._verdict(super().ignore_eos_decode_fits(req_states, **request))
+
+
 class SWAPrefillBudget(PrefillBudget):
     """Separate FULL/SWA partitions, including per-request SWA rings."""
 

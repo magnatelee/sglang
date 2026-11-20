@@ -357,6 +357,24 @@ def test_load_cache_to_device_buffer_fast_path_overwrites_stale_output() -> None
     assert torch.equal(out.cpu(), torch.tensor([[7, -1, -1, -1]], dtype=torch.int32))
 
 
+def test_zero_length_row_selects_nothing_and_keeps_buffer_state() -> None:
+    """A request whose KV is read where it is has no hot buffer; its row reaches the
+    kernel with length zero and must come back unselected, with nothing evicted."""
+    state = _long_case()
+    before = {name: tensor.clone() for name, tensor in state.items()}
+
+    out = _run_kernel(
+        top_k_tokens=torch.tensor([[7, 1, 6]], dtype=torch.int32, device=DEVICE),
+        seq_len=0,
+        output_fill_value=5,
+        **state,
+    )
+
+    assert torch.equal(out.cpu(), torch.full((1, 3), -1, dtype=torch.int32))
+    for name in ("device_buffer_tokens", "lru_slots", "device_buffer"):
+        assert torch.equal(state[name].cpu(), before[name].cpu()), name
+
+
 def test_load_cache_to_device_buffer_hits_newest_and_updates_lru() -> None:
     state = _long_case()
 

@@ -435,6 +435,46 @@ class TestHiSparseSpec(CustomTestCase):
 
         self.assertEqual(int(miss_count[1].item()), 0)
 
+    def test_zero_length_request_keeps_its_cache_and_scratch(self) -> None:
+        """A request whose KV is read where it is reaches the kernels with length zero
+        in every step: nothing may be selected, copied or rotated for it, while the
+        request next to it still resolves its misses."""
+        hot_size, page_size = 4096, 64
+        num_steps, top_k = 4, 2048
+        state = _make_state(
+            num_reqs=2,
+            hot_buffer_size=hot_size,
+            page_size=page_size,
+            scratch_size=hot_size,
+            seq_len=8192,
+            item_words=1,
+            metadata_occurrences=num_steps * top_k,
+        )
+        # Every step misses 196 tokens past the hot buffer.
+        step = torch.arange(top_k, dtype=torch.int32, device=DEVICE) + hot_size - 1852
+        top_k_tokens = step.view(1, 1, -1).repeat(2, num_steps, 1).contiguous()
+        seq_lens = torch.full((2 * num_steps,), 8192, dtype=torch.int32, device=DEVICE)
+        seq_lens[:num_steps] = 0
+        tokens_before = state.device_buffer_tokens.clone()
+        locs_before = state.device_buffer_locs.clone()
+        scratch_before = state.swap_state.scratch_locs.clone()
+        index_before = state.swap_state.cache_index.clone()
+        physical_tokens_per_req = state.device_buffer.shape[0] // 2
+        rows_before = state.device_buffer[:physical_tokens_per_req].clone()
+
+        out = _run_swap(top_k_tokens=top_k_tokens, seq_lens=seq_lens, state=state)
+        torch.cuda.synchronize()
+
+        self.assertTrue(torch.all(out[0] == -1).item())
+        torch.testing.assert_close(state.device_buffer_tokens[0], tokens_before[0])
+        torch.testing.assert_close(state.device_buffer_locs[0], locs_before[0])
+        torch.testing.assert_close(state.swap_state.scratch_locs[0], scratch_before[0])
+        torch.testing.assert_close(state.swap_state.cache_index[0], index_before[0])
+        torch.testing.assert_close(
+            state.device_buffer[:physical_tokens_per_req], rows_before
+        )
+        _assert_output_matches_tokens(state, out[1], top_k_tokens[1])
+
     def test_resolves_all_speculative_extra_page_slots_without_host_io(self) -> None:
         hot_size, page_size = 4096, 64
         num_steps, top_k = 4, 2048

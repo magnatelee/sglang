@@ -12,10 +12,12 @@ from sglang.kernels.ops.kvcache.hisparse import (
 from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
     translate_padded_hisparse_locations,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.base_hisparse_memory_pool import (
     HiSparseDevicePoolMappingMixin,
 )
+from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
@@ -43,6 +45,30 @@ else:
         )
 
 
+class _MappedIndexKeyCache(IndexKeyCache):
+    """Index keys in a mapped address range, one region per indexer layer; pages
+    are backed as logical pages come into use."""
+
+    def __init__(self, pool: DSATokenToKVPool, index_buf_size: int, key_range):
+        self._key_range = key_range
+        self._num_regions_used = 0
+        super().__init__(pool, index_buf_size)
+
+    def _allocate_buffer(self, shape: tuple[int, int]) -> torch.Tensor:
+        num_pages, page_bytes = shape
+        if num_pages == 0:
+            return super()._allocate_buffer(shape)
+        key_range = self._key_range
+        # The ranges were sized from these two numbers before the pool was built.
+        el = self.pool._hs_el
+        assert shape == (el["ik_pages"], el["ik_page_bytes"]), (shape, el)
+        view = key_range.view(self._num_regions_used, num_pages * page_bytes)
+        self._num_regions_used += 1
+        view = view.view(num_pages, page_bytes)
+        view[: key_range.mapped // page_bytes].zero_()
+        return view
+
+
 class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool):
     def __init__(
         self,
@@ -68,6 +94,45 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
     ):
+        # The parent constructors create the buffers: paged residency maps them
+        # into address ranges whose sizes follow from the index-key reservation.
+        self._hs_el = None
+        self._hs_ratio = host_to_device_ratio
+        self._hs_va = None
+        # The host pool's tokens over the device pool's: the logical ratio unless
+        # exclusive placement names a smaller host pool.
+        self._hs_host_ratio = host_to_device_ratio
+        if envs.SGLANG_HISPARSE_PAGED.get():
+            index_buf_size = int(size * host_to_device_ratio) // page_size * page_size
+            host_tokens = (
+                envs.SGLANG_HISPARSE_PAGED_HOST_TOKENS.get()
+                if envs.SGLANG_HISPARSE_PAGED_EXCLUSIVE.get()
+                else 0
+            )
+            if host_tokens:
+                if (
+                    host_tokens < 0
+                    or host_tokens % page_size
+                    or host_tokens > index_buf_size
+                ):
+                    raise ValueError(
+                        "SGLANG_HISPARSE_PAGED_HOST_TOKENS must be a multiple of the "
+                        f"page size ({page_size}) and at most the logical pool "
+                        f"({index_buf_size} tokens), got {host_tokens}."
+                    )
+                # + 0.5: int(size * ratio) gives host_tokens exactly.
+                self._hs_host_ratio = (host_tokens + 0.5) / size
+            skips = skip_topk_layers if skip_topk_layers is not None else []
+            self._hs_el = dict(
+                size=size,
+                # IndexKeyCache's page count for index_buf_size.
+                ik_pages=(index_buf_size + page_size + 1) // page_size,
+                n_ik=layer_num - sum(skips),
+                ik_page_bytes=page_size
+                // index_kpool
+                * self.index_bytes_per_token_for(index_head_dim, use_fp4_indexer),
+                headroom=envs.SGLANG_HISPARSE_PAGED_INDEX_K_HEADROOM_PAGES.get(),
+            )
         super().__init__(
             size=size,
             page_size=page_size,
@@ -81,7 +146,8 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
             kv_cache_dim=kv_cache_dim,
             start_layer=start_layer,
             end_layer=end_layer,
-            index_buf_size=size * host_to_device_ratio,
+            # page-aligned integer for a fractional ratio (= the allocator's logical size)
+            index_buf_size=int(size * host_to_device_ratio) // page_size * page_size,
             index_kpool=index_kpool,
             index_kpool_compress=index_kpool_compress,
             tail_extra_slots=tail_extra_slots,
@@ -93,6 +159,97 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
         self.data_strides = torch.full_like(self.data_ptrs, self.bytes_per_token)
+
+    # ---- elastic range ------------------------------------------------------------------------------------------------
+    def _create_buffers(self):
+        el = self._hs_el
+        if el is None:
+            return super()._create_buffers()
+        from sglang.srt.mem_cache.hisparse_elastic import ElasticFamily
+
+        row = self.kv_cache_dim * torch._utils._element_size(self.store_dtype)
+        E = el["n_ik"] * el["ik_pages"] * el["ik_page_bytes"]
+        band_max = E // (self.layer_num * row) // self.page_size * self.page_size
+        rows_max = self.size + band_max + self.page_size
+        # The host pool's rows follow in the same range: MLATokenToKVPoolHost.size
+        # for device_capacity_tokens=self.size (pool_host/base.py).
+        host_rows = (
+            int(self.size * self._hs_host_ratio) // self.page_size + 1
+        ) * self.page_size
+        fam = ElasticFamily(
+            self.device,
+            self.layer_num,
+            rows_max * row,
+            (self.size + self.page_size) * row,
+            "kv",
+            host_rows=host_rows,
+            item=row,
+            page=self.page_size,
+        )
+        self._hs_va = fam
+        el.update(
+            row=row,
+            E=E,
+            band_max=band_max,
+            k_min=self.size,
+            k_max=self.size + band_max,
+            kv=fam,
+        )
+        self.kv_buffer = [
+            fam.view(l, rows_max * row)
+            .view(self.store_dtype)
+            .view(rows_max, 1, self.kv_cache_dim)
+            for l in range(self.layer_num)
+        ]
+        for b in self.kv_buffer:  # the static pool's torch.zeros
+            b[: self.size + self.page_size].zero_()
+        logger.info(
+            "HiSparse elastic: device pool %d slots static + band up to %d slots (%.1f GiB of index-K reservation "
+            "to lend), %d layers x %d B rows",
+            self.size,
+            band_max,
+            E / 2**30,
+            self.layer_num,
+            row,
+        )
+
+    def _create_index_key_cache(self):
+        el = self._hs_el
+        if el is None:
+            return super()._create_index_key_cache()
+        from sglang.srt.mem_cache.hisparse_elastic import ElasticFamily
+
+        pages, page_bytes = el["ik_pages"], el["ik_page_bytes"]
+        ik_layers = [i for i in range(self.layer_num) if not self.skip_topk_layers[i]]
+        fam = ElasticFamily(self.device, len(ik_layers), pages * page_bytes, 0, "ik")
+        # Graph capture writes dummy keys into the first pages.
+        fam.grow_to((el["headroom"] + 2) * page_bytes)
+        el.update(ik=fam, ik_layers=ik_layers)
+        return _MappedIndexKeyCache(self, self.index_buf_size, fam)
+
+    # ---- paged residency: the host pool and attention's index space in the KV family's range ---------------------------
+    def hs_host_region(
+        self, host_rows: int, dtype: torch.dtype, dim: int
+    ) -> torch.Tensor:
+        """The host pool's buffer (layer_first [layers, host_rows, 1, dim]); one slab per layer, so not contiguous."""
+        assert self._hs_va is not None and host_rows == self._hs_va.host_rows, (
+            host_rows,
+            self._hs_va.host_rows,
+        )
+        return (
+            self._hs_va.host_region()
+            .view(dtype)
+            .view(self.layer_num, host_rows, 1, dim)
+        )
+
+    def get_key_buffer(self, layer_id: int):
+        if self._hs_va is None:
+            return super().get_key_buffer(layer_id)
+        view = self._hs_va.unified_view(layer_id - self.start_layer).view(
+            self.store_dtype
+        )
+        view = view.view(-1, 1, self.kv_cache_dim)
+        return view.view(self.dtype) if self.store_dtype != self.dtype else view
 
     def translate_loc_to_hisparse_device(
         self, compressed_indices: torch.Tensor

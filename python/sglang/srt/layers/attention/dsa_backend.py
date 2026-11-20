@@ -107,6 +107,10 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_paged_mqa_logits_metadata_fn,
     should_use_dsa_fused_topk,
 )
+from sglang.srt.layers.attention.graph_variants import (
+    AttentionGraphVariants,
+    HiSparseResidentGraphVariants,
+)
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
     prepare_kv_shard_forward,
@@ -5098,7 +5102,20 @@ class DeepseekSparseAttnBackend(
             force_unfused_topk=force_unfused,
             packed_extend_topk=self.dsa_packed_extend_topk,
             dcp_size=1 if self.dsa_shards_index_k else self.attn_dcp_size,
+            resident_page_table=(
+                self.hisparse_coordinator.resident_page_table(self.forward_metadata)
+                if self.hisparse_coordinator is not None
+                else None
+            ),
         )
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        coordinator = self.hisparse_coordinator
+        if coordinator is not None and coordinator.enable_resident:
+            return HiSparseResidentGraphVariants(coordinator)
+        return None
 
     def _compute_flashmla_metadata(
         self,

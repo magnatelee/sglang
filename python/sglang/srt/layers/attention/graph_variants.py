@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 import msgspec
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -66,6 +67,28 @@ class SeqLenBucketGraphVariants(msgspec.Struct, frozen=True):
                 if max_seq_len <= limit:
                     return label
         return self.fallback_label
+
+
+HISPARSE_MIXED = "hisparse_mixed"
+HISPARSE_RESIDENT = "hisparse_resident"
+
+
+class HiSparseResidentGraphVariants(msgspec.Struct, frozen=True):
+    """HiSparse decode graphs: one for batches whose requests all keep their KV in
+    the device pool, which runs no swap-in, and one for every other batch."""
+
+    coordinator: HiSparseCoordinator
+
+    @property
+    def capture_labels(self) -> tuple[str, ...]:
+        # Mixed first: its capture peak (the swap-in workspaces) subsumes the
+        # resident graph's in the shared pool.
+        return (HISPARSE_MIXED, HISPARSE_RESIDENT)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        if self.coordinator.hs_batch_all_resident(forward_batch):
+            return HISPARSE_RESIDENT
+        return HISPARSE_MIXED
 
 
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:

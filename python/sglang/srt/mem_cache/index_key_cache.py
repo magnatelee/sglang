@@ -29,13 +29,18 @@ class IndexKeyCache:
                 else nullcontext()
             ):
                 self.buffer = [
-                    torch.zeros(
-                        self._buffer_shape(self._layer_num_pages(i, num_pages)),
-                        dtype=pool.index_k_with_scale_buffer_dtype,
-                        device=pool.device,
+                    self._allocate_buffer(
+                        self._buffer_shape(self._layer_num_pages(i, num_pages))
                     )
                     for i in range(pool.layer_num)
                 ]
+
+    def _allocate_buffer(self, shape: tuple[int, int]) -> torch.Tensor:
+        return torch.zeros(
+            shape,
+            dtype=self.pool.index_k_with_scale_buffer_dtype,
+            device=self.pool.device,
+        )
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool

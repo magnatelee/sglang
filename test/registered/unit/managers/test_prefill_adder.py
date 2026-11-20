@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
     ChainPrefillBudget,
+    HiSparsePagedPrefillBudget,
     PrefillBudget,
     SWAPrefillBudget,
     estimate_swa_kv_tokens,
@@ -1326,6 +1327,37 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(result, AddReqResult.NO_TOKEN)
         self.assertEqual(adder.can_run_list, [])
         self.assertIsNone(req.extend_end)
+
+    def test_paged_hisparse_request_no_wait_can_admit_is_unschedulable(self):
+        """A request the paged HiSparse pool cannot hold is refused as unschedulable
+        while no request holds pool memory, on both admission paths; it waits
+        while one does."""
+        allocator = self.mock_token_allocator
+        allocator.available_size.return_value = 64
+        allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
+            HiSparsePagedPrefillBudget(allocator, tree_cache, **kwargs)
+        )
+        for ignore_eos, held, expected in (
+            (True, False, AddReqResult.UNSCHEDULABLE),
+            (True, True, AddReqResult.NO_TOKEN),
+            (False, False, AddReqResult.UNSCHEDULABLE),
+            (False, True, AddReqResult.NO_TOKEN),
+        ):
+            with self.subTest(ignore_eos=ignore_eos, held=held):
+                self.mock_tree_cache.disable = ignore_eos
+                allocator.holds_request_tokens.return_value = held
+                adder = self.create_adder(self.create_running_batch(), page_size=16)
+                req = self.create_mock_req("long", priority=0, max_new_tokens=1)
+                req.sampling_params.ignore_eos = ignore_eos
+                req.origin_input_ids = list(range(128))
+                req.full_untruncated_fill_ids = list(range(128))
+
+                result = adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+
+                self.assertIs(result, expected)
+                self.assertEqual(adder.can_run_list, [])
 
     def create_sharded_adder(
         self,

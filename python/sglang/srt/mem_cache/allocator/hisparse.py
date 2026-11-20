@@ -23,6 +23,9 @@ if TYPE_CHECKING:
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    _reclaimer = None  # (class default for allocators built without __init__)
+    _buffered_prompt_tokens = 0  # (class default)
+
     def __init__(
         self,
         size: int,
@@ -34,7 +37,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         host_to_device_ratio: int = 2,
     ):
         self._kvcache = kvcache
-        self._size_full = size * host_to_device_ratio
+        # a fractional ratio gives a page-aligned integer logical size (the index-K buffer uses the same rule)
+        self._size_full = int(size * host_to_device_ratio) // page_size * page_size
         self._size_hisparse = size
         self.compress_ratio = 1
         self.dtype = dtype
@@ -43,6 +47,10 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.need_sort = need_sort
         self._spec_scratch_capacity = 0
         self._spec_device_buffer_size = 0
+        self._reclaimer = None  # the coordinator, which can move resident pages to host
+        # Exclusive placement: prompts up to this length stay buffered and hold host
+        # slots besides their device slots (0: every token has a host slot anyway).
+        self._buffered_prompt_tokens = 0
 
         paged_allocator_cls = (
             current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
@@ -55,14 +63,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
+        # the device allocator spans the band too; only mapped pages are handed out
+        self._hs_el = getattr(kvcache, "_hs_el", None)
         self.hisparse_attn_allocator = paged_allocator_cls(
-            self._size_hisparse,
+            self._hs_el["k_max"] if self._hs_el else self._size_hisparse,
             self.page_size,
             self.dtype,
             self.device,
             kvcache,
             need_sort,
         )
+        if self._hs_el is not None:
+            self._hs_el_init_limits()
         self.full_to_hisparse_device_index_mapping = torch.cat(
             [
                 torch.zeros(
@@ -103,7 +115,44 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         # missing slots, including on chunks whose scratch was already allocated.
         buffer_reserve = max(self._spec_device_buffer_size - paged_prefill, 0)
         scratch_reserve = 0 if has_req_pool_slot else self._spec_scratch_capacity
-        return buffer_reserve + scratch_reserve
+        return (
+            buffer_reserve
+            + scratch_reserve
+            + self._buffered_host_reserve(
+                has_req_pool_slot=has_req_pool_slot, prefill_tokens=prefill_tokens
+            )
+        )
+
+    def _buffered_host_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int
+    ) -> int:
+        """Exclusive placement: a prompt that stays buffered takes a host slot per
+        token on top of the device slots its prefill is charged for, and waits
+        while the host side cannot take it. It holds them once it has its slot."""
+        if has_req_pool_slot or not 0 < prefill_tokens <= self._buffered_prompt_tokens:
+            return 0
+        reserve = -(-prefill_tokens // self.page_size) * self.page_size
+        if self._reclaimer is not None:
+            reserve += self._reclaimer.exclusive_host_shortfall(
+                device_free=self._exclusive_device_free()
+            )
+        return reserve
+
+    def check_decode_capacity(
+        self, *, num_tokens: int, tree_cache, requests=None, spec_algorithm=None
+    ) -> bool:
+        fits = super().check_decode_capacity(
+            num_tokens=num_tokens,
+            tree_cache=tree_cache,
+            requests=requests,
+            spec_algorithm=spec_algorithm,
+        )
+        # Exclusive placement: the buffered requests' host pages are not in that count.
+        if fits and self._buffered_prompt_tokens and requests is not None:
+            fits = self._reclaimer.exclusive_host_fits(
+                requests, device_free=self._exclusive_device_free()
+            )
+        return fits
 
     @property
     def size_full(self) -> int:
@@ -113,11 +162,173 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def size(self) -> int:
         return self._size_full
 
+    def set_reclaimer(self, reclaimer) -> None:
+        self._reclaimer = reclaimer
+
     def available_size(self) -> int:
+        if self._reclaimer is not None and self._reclaimer.hs_exclusive is True:
+            return self._exclusive_available_size()
+        # Device slots that moving resident pages to host would free count as available for admission.
+        reclaimable = (
+            self._reclaimer.reclaimable_slots() if self._reclaimer is not None else 0
+        )
+        if self._hs_el is not None:  # admission sees the static layout
+            el = self._hs_el
+            logical = (
+                self.logical_attn_allocator.available_size()
+                + max(0, self.logical_attn_allocator.num_pages - el["log_max_page"])
+                * self.page_size
+            )
+            band = el["kv"].mapped // el["row"] - (el["k_min"] + self.page_size)
+            return min(
+                logical,
+                self.hisparse_attn_allocator.available_size()
+                + reclaimable
+                - max(0, band),
+            )
         return min(
             self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size(),
+            self.hisparse_attn_allocator.available_size() + reclaimable,
         )
+
+    def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
+        if self._reclaimer is None:
+            return super().create_prefill_budget(
+                tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+            )
+        from sglang.srt.mem_cache.prefill_budget import HiSparsePagedPrefillBudget
+
+        return HiSparsePagedPrefillBudget(
+            self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
+        )
+
+    def holds_request_tokens(self) -> bool:
+        """Whether a request holds logical slots, which it gives back when it ends."""
+        logical = self.logical_attn_allocator
+        free = logical.available_size()
+        if self._hs_el is not None:  # logical pages past the mapped index keys are free
+            free += (
+                max(0, logical.num_pages - self._hs_el["log_max_page"]) * self.page_size
+            )
+        return free < self._size_full
+
+    def _exclusive_device_free(self) -> int:
+        """Free device slots of the static layout (the band is lent memory)."""
+        el = self._hs_el
+        band = el["kv"].mapped // el["row"] - (el["k_min"] + self.page_size)
+        return self.hisparse_attn_allocator.available_size() - max(0, band)
+
+    def _exclusive_available_size(self) -> int:
+        """Exclusive placement: a token needs a logical slot and a device slot or a
+        host slot; the coordinator prices what the two pools can still take."""
+        el = self._hs_el
+        logical = (
+            self.logical_attn_allocator.available_size()
+            + max(0, self.logical_attn_allocator.num_pages - el["log_max_page"])
+            * self.page_size
+        )
+        return self._reclaimer.exclusive_available_slots(
+            logical_free=logical, device_free=self._exclusive_device_free()
+        )
+
+    # ---- elastic range ------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _hs_el_filter(alloc, max_page: int) -> None:
+        alloc.merge_and_sort_free()
+        alloc.free_pages = alloc.free_pages[alloc.free_pages <= max_page]
+
+    def _hs_el_init_limits(self) -> None:
+        el = self._hs_el
+        P = self.page_size
+        el["dev_max_page"] = el["kv"].mapped // el["row"] // P - 1
+        el["log_max_page"] = min(
+            self.logical_attn_allocator.num_pages,
+            el["ik"].mapped // el["ik_page_bytes"] - 1,
+        )
+        self._hs_el_filter(self.hisparse_attn_allocator, el["dev_max_page"])
+        self._hs_el_filter(self.logical_attn_allocator, el["log_max_page"])
+        for alloc, key in (
+            (self.hisparse_attn_allocator, "dev_max_page"),
+            (self.logical_attn_allocator, "log_max_page"),
+        ):
+            orig = alloc.merge_and_sort_free
+
+            def merge(
+                orig=orig, alloc=alloc, key=key
+            ):  # pages above the mapped limit never come back
+                orig()
+                alloc.free_pages = alloc.free_pages[alloc.free_pages <= el[key]]
+
+            alloc.merge_and_sort_free = merge
+            # Every freed page passes through _release_page_ids (free, free_page_ids,
+            # free groups; both need_sort modes). A page above the current limit is
+            # unmapped or about to be (an eviction inside a band take-back frees pages
+            # above the lowered limit); it must not re-enter the free list, where
+            # need_sort=False puts it first in line. Raising the limit adds the range back.
+            orig_rel = alloc._release_page_ids
+
+            def release(*page_ids, orig_rel=orig_rel, key=key):
+                orig_rel(*[p[p <= el[key]] for p in page_ids])
+
+            alloc._release_page_ids = release
+
+    def hs_el_set_limit(self, which: str, new_max: int) -> None:
+        """Raise (add the new pages) or lower (drop pages above; the caller made them free) an allocator's limit."""
+        el = self._hs_el
+        alloc = (
+            self.hisparse_attn_allocator
+            if which == "dev"
+            else self.logical_attn_allocator
+        )
+        key = "dev_max_page" if which == "dev" else "log_max_page"
+        old = el[key]
+        if new_max > old:
+            alloc.merge_and_sort_free()  # under the old limit: freed pages above it are dropped, not duplicated
+            alloc.free_pages = alloc.free_pages[
+                alloc.free_pages <= old
+            ]  # never two copies of an added page
+            el[key] = new_max
+            add = torch.arange(
+                old + 1, new_max + 1, dtype=torch.int64, device=self.device
+            )
+            alloc.free_pages, _ = torch.sort(torch.cat((alloc.free_pages, add)))
+        elif new_max < old:
+            el[key] = new_max
+            self._hs_el_filter(alloc, new_max)
+
+    def hs_alloc_below(self, need_size: int, max_slot: int):
+        """need_size slots from pages entirely below max_slot (None if there are not enough)."""
+        alloc = self.hisparse_attn_allocator
+        P = self.page_size
+        n = need_size // P
+        alloc.merge_and_sort_free()
+        ok = alloc.free_pages < (max_slot // P)
+        cand = alloc.free_pages[ok]
+        if len(cand) < n:
+            return None
+        take = cand[:n]
+        alloc.free_pages = torch.cat((cand[n:], alloc.free_pages[~ok]))
+        alloc.free_pages, _ = torch.sort(alloc.free_pages)
+        return (take[:, None] * P + torch.arange(P, device=self.device)).reshape(-1)
+
+    def hs_alloc_above(self, need_size: int, min_slot: int):
+        """need_size slots from pages entirely at or above min_slot (None if there are not enough)."""
+        alloc = self.hisparse_attn_allocator
+        P = self.page_size
+        n = need_size // P
+        alloc.merge_and_sort_free()
+        ok = alloc.free_pages >= -(-min_slot // P)
+        cand = alloc.free_pages[ok]
+        if len(cand) < n:
+            return None
+        take = cand[:n]
+        alloc.free_pages, _ = torch.sort(torch.cat((alloc.free_pages[~ok], cand[n:])))
+        return (take[:, None] * P + torch.arange(P, device=self.device)).reshape(-1)
+
+    def hs_copy_rows(self, src: torch.Tensor, dst: torch.Tensor) -> None:
+        """copy device rows src -> dst in every layer."""
+        for buf in self._kvcache.kv_buffer:
+            buf[dst] = buf[src]
 
     def get_kvcache(self):
         return self._kvcache
@@ -164,6 +375,14 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         """Allocate only logical indices without hisparse device indices."""
+        if self._hs_el is not None and self._reclaimer is not None:
+            self._reclaimer.hs_el_ensure_logical(
+                get_num_new_pages(
+                    seq_lens=seq_lens_cpu,
+                    page_size=self.page_size,
+                    prefix_lens=prefix_lens_cpu,
+                )
+            )
         return self.logical_attn_allocator.alloc_extend(
             prefix_lens,
             prefix_lens_cpu,
@@ -183,6 +402,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
             self.free_hisparse_indices(hisparse_indices[need_size:])
+            if self._hs_el is not None:
+                buffer_indices = self._hs_el_buffer_below(buffer_indices)
         else:
             # page alignment, claiming the residual space for an incomplete page
             page_residual_length = len(hisparse_indices) % self.page_size
@@ -200,14 +421,61 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                         ),
                     ]
                 )
-            extra_indices = self.hisparse_attn_allocator.alloc(
-                need_size - len(hisparse_indices)
-            )
+            need_extra = need_size - len(hisparse_indices)
+            if (  # admission counted resident requests' pages as free; move pages to host to free them
+                self._reclaimer is not None
+                and getattr(self._reclaimer, "hs_spec_res", False) is True
+                and self.hisparse_attn_allocator.available_size() < need_extra
+            ):
+                self._reclaimer.hs_spec_reclaims[1] += 1
+                self._reclaimer.reclaim_device(need_extra)
+            if self._hs_el is not None:  # buffers live below the band
+                if len(hisparse_indices):
+                    hisparse_indices = self._hs_el_buffer_below(hisparse_indices)
+                extra_indices = self._hs_el_alloc_below_or_evict(need_extra)
+            else:
+                extra_indices = self.hisparse_attn_allocator.alloc(need_extra)
             assert extra_indices is not None, (
                 "Hisparse allocation failed in alloc_device_buffer"
             )
             buffer_indices = torch.cat([hisparse_indices, extra_indices])
         return buffer_indices
+
+    def _hs_el_alloc_below_or_evict(self, need_size: int):
+        floor = self._hs_el["k_min"] + self.page_size
+        out = self.hs_alloc_below(need_size, floor)
+        while (
+            out is None
+            and self._reclaimer is not None
+            and self._reclaimer.hs_el_evict_below_band()
+        ):
+            out = self.hs_alloc_below(need_size, floor)
+        return out
+
+    def _hs_el_buffer_below(self, slots: torch.Tensor) -> torch.Tensor:
+        """a buffer must not sit in the band (it is not reachable through the logical map, so the band
+        could not be taken back): pages at or above the static pool are copied to fresh pages below it."""
+        floor = self._hs_el["k_min"] + self.page_size
+        P = self.page_size
+        high = slots >= floor
+        if not bool(high.any()):
+            return slots
+        hs = slots[high]
+        pages = torch.unique(hs // P)
+        new = self._hs_el_alloc_below_or_evict(len(pages) * P)
+        if new is None:
+            raise RuntimeError("HiSparse elastic: no room below the band for a buffer")
+        new_pages = new.view(-1, P)[:, 0] // P
+        src = (pages[:, None] * P + torch.arange(P, device=self.device)).reshape(-1)
+        dst = (new_pages[:, None] * P + torch.arange(P, device=self.device)).reshape(-1)
+        self.hs_copy_rows(src, dst)
+        self.free_hisparse_indices(src)
+        idx = torch.searchsorted(pages, hs // P)
+        out = slots.clone()
+        out[high] = new_pages[idx] * P + hs % P
+        if self._reclaimer is not None:
+            self._reclaimer.hs_el_stats[3] += len(pages)
+        return out
 
     def free_hisparse_indices(self, buffer_indices: torch.Tensor):
         # Page zero is the padding sink and is never owned by a request.
@@ -233,11 +501,26 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
+        if self._hs_el is not None and self._reclaimer is not None:
+            self._reclaimer.hs_el_ensure_logical(num_new_pages)
         if (
             num_new_pages
             > self.logical_attn_allocator.available_size() // self.page_size
         ):
             return None
+        if (
+            self._hs_el is not None
+            and self._reclaimer is not None
+            and num_new_pages
+            > self.hisparse_attn_allocator.available_size() // self.page_size
+        ):  # keep the index-K this allocation's logical pages need (ensure_logical just mapped it)
+            self._reclaimer.hs_el_grow_band(keep_extra=num_new_pages)
+        if (
+            self._reclaimer is not None  # move resident pages to host to make room
+            and num_new_pages
+            > self.hisparse_attn_allocator.available_size() // self.page_size
+        ):
+            self._reclaimer.reclaim_device(num_new_pages * self.page_size)
         if (
             num_new_pages
             > self.hisparse_attn_allocator.available_size() // self.page_size
@@ -276,19 +559,44 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,  # last_loc for full layers
     ):
+        if self._hs_el is not None and self._reclaimer is not None:
+            self._reclaimer.hs_el_ensure_logical(len(seq_lens_cpu) + 1)
         return self.logical_attn_allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc
         )
 
+    host_row0 = None  # map entries at or above this row index name host rows
+
     def free_hisparse(self, free_indices: torch.Tensor):
         hisparse_indices = self._kvcache._translate_loc_to_hisparse_device(free_indices)
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
+        if self.host_row0 is not None:  # pages on host hold no device slot
+            hisparse_indices = hisparse_indices[hisparse_indices < self.host_row0]
         self.free_hisparse_indices(hisparse_indices)
         self.full_to_hisparse_device_index_mapping[free_indices] = 0
+
+    def hs_keep_reserved(self, slots: torch.Tensor) -> None:
+        """Device slots taken for the server's lifetime (row-cache scratch rows): clear() must not hand them out."""
+        pages = torch.unique(slots.to(torch.int64) // self.page_size)
+        prev = getattr(self, "_hs_reserved_pages", None)
+        self._hs_reserved_pages = (
+            pages if prev is None else torch.unique(torch.cat((prev, pages)))
+        )
 
     def clear(self):
         self.logical_attn_allocator.clear()
         self.hisparse_attn_allocator.clear()
+        res = getattr(self, "_hs_reserved_pages", None)
+        if res is not None:  # row-cache scratch rows stay reserved across a cache flush
+            dev = self.hisparse_attn_allocator
+            dev.free_pages = dev.free_pages[
+                ~torch.isin(dev.free_pages, res.to(dev.free_pages.device))
+            ]
+        if self._hs_el is not None:  # only mapped pages are free
+            self._hs_el_filter(
+                self.hisparse_attn_allocator, self._hs_el["dev_max_page"]
+            )
+            self._hs_el_filter(self.logical_attn_allocator, self._hs_el["log_max_page"])
         # Keep the trailing -1: it is what a last_loc of -1 translates to.
         self.full_to_hisparse_device_index_mapping[:-1].fill_(0)
         self.free_group = None

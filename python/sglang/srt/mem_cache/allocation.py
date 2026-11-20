@@ -407,6 +407,7 @@ def alloc_for_extend(
     # slot so subsequent scheduling sees the remaining physical capacity.
     if batch.hisparse_coordinator is not None:
         batch.hisparse_coordinator.allocate_spec_scratch(req_pool_indices)
+        batch.hisparse_coordinator.reserve_buffered_host_rows(batch.reqs)
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)

@@ -103,8 +103,29 @@ class DSATopKBackend(Enum):
         batch_idx_list: Optional[List[int]] = None,
         force_unfused_topk: bool = False,
         packed_extend_topk: bool = False,
+        resident_page_table: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
+            if resident_page_table is not None:
+                # HiSparse, every request resident: the selected positions map
+                # straight to the rows that hold them, with no swap-in after.
+                if not (
+                    self.should_use_topk_v2()
+                    and topk_transform_method == TopkTransformMethod.PAGED
+                    and row_starts is None
+                    and batch_idx_list is None
+                ):
+                    raise ValueError(
+                        "HiSparse resident decode needs the paged top-k v2 kernel "
+                        "(sgl-kernel top-k backend, decode-shaped scores)."
+                    )
+                return _topk_transform_v2_paged(
+                    logits,
+                    lengths,
+                    topk,
+                    attn_metadata,
+                    page_table=resident_page_table,
+                )
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec
@@ -317,6 +338,7 @@ def _topk_transform_v2_paged(
     lengths: torch.Tensor,
     topk: int,
     attn_metadata,
+    page_table: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fused top-k + page-table transform via the DeepSeek-V4 v2 JIT kernel.
 
@@ -366,7 +388,10 @@ def _topk_transform_v2_paged(
     )
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
-    page_table = attn_metadata.real_page_table
+    # A caller that places pages itself (HiSparse resident requests) passes its
+    # own table with the layout of `real_page_table`.
+    if page_table is None:
+        page_table = attn_metadata.real_page_table
 
     # The plan is preprocessed once per forward (DSAMetadata.topk_v2_plan,
     # refreshed in-place under CUDA graph) and reused across layers. A missing or

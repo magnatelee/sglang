@@ -1727,7 +1727,7 @@ class PrefillAdder:
             cached_tokens=req.prefix_len,
         )
         if not fits:
-            return AddReqResult.NO_TOKEN
+            return self._refused()
 
         def add_req_state(r, insert_sort=False):
             new_token_ratio = (
@@ -1775,7 +1775,7 @@ class PrefillAdder:
             request_rows=self._request_rows_for_req(req),
             cached_tokens=req.prefix_len,
         ):
-            return AddReqResult.NO_TOKEN
+            return self._refused()
 
         if (self.prefill_delayer_single_pass is not None) and (
             not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(

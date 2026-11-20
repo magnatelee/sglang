@@ -107,6 +107,9 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     # (see DSATopKBackend); unsharded batches take it either way
     packed_extend_topk: bool = False
     indexer_page_table: Optional[torch.Tensor] = None
+    # HiSparse, every request of the batch resident: the page table the top-k maps
+    # selected positions through instead of the forward's own.
+    resident_page_table: Optional[torch.Tensor] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -182,4 +185,5 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             batch_idx_list=batch_idx_list,
             force_unfused_topk=self.force_unfused_topk,
             packed_extend_topk=self.packed_extend_topk,
+            resident_page_table=self.resident_page_table,
         )

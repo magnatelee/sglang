@@ -808,6 +808,49 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # HiSparse paged residency (GLM-style DSA): a request longer than the hot buffer
+    # keeps its KV where the prefill wrote it instead of being swapped in per step;
+    # its hot 64-token pages stay in the device pool, its cold pages are read in
+    # place from host memory mapped into the pool's address range, and index-key
+    # memory not yet in use is lent to the device pool.
+    SGLANG_HISPARSE_PAGED = EnvBool(False)
+    # Index-key pages kept mapped above the highest logical page in use.
+    SGLANG_HISPARSE_PAGED_INDEX_K_HEADROOM_PAGES = EnvInt(4096)
+    SGLANG_HISPARSE_PAGED_GROUP_PAGES = EnvInt(
+        128
+    )  # pages moved per indexer layer group per tick at most
+    SGLANG_HISPARSE_PAGED_TICK_STEPS = EnvInt(
+        16
+    )  # decode steps between placement ticks
+    SGLANG_HISPARSE_PAGED_EVICT_PAGES = EnvInt(
+        256
+    )  # pages evicted per eviction, at least
+    SGLANG_HISPARSE_PAGED_HALF_LIFE = EnvInt(
+        2000
+    )  # half-life of the page scores, in decode steps
+    SGLANG_HISPARSE_PAGED_HYST = EnvFloat(
+        1.25
+    )  # a page moves into a device frame only if this much hotter than what sits there
+    SGLANG_HISPARSE_PAGED_MIN_SCORE = EnvFloat(4.0)  # and at least this hot
+    SGLANG_HISPARSE_PAGED_ROWCACHE_ROWS = EnvInt(
+        0
+    )  # rows of the host-row cache of the all-resident graph (a power of two; 0: read host rows in place)
+    SGLANG_HISPARSE_PAGED_ROWCACHE_BLOCKS = EnvInt(
+        16
+    )  # host-row cache: programs of the install copy kernel
+    SGLANG_HISPARSE_PAGED_ROWCACHE_LIST = EnvInt(
+        65536
+    )  # host-row cache: rows a layer group can install per step
+    SGLANG_HISPARSE_PAGED_CHECK = EnvBool(
+        False
+    )  # assert the page invariants (syncs; tests only)
+    # Paged residency with exclusive placement: a page that sits in the device pool
+    # gives its host slot back when the slot is needed, so the logical pool
+    # (host_to_device_ratio x the device pool) may exceed the host pool by the
+    # device frames. Off: every token keeps a host slot.
+    SGLANG_HISPARSE_PAGED_EXCLUSIVE = EnvBool(False)
+    # Host pool tokens per rank under SGLANG_HISPARSE_PAGED_EXCLUSIVE; 0 = the logical pool.
+    SGLANG_HISPARSE_PAGED_HOST_TOKENS = EnvInt(0)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
