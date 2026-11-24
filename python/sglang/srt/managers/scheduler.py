@@ -2986,6 +2986,11 @@ class Scheduler(
             uocr_runtime=self.uocr_runtime,
             send_abort_output=self.send_abort_output,
             stream_output=self.output_streamer.stream_output,
+            defer_hisparse_release=(
+                self.hisparse_coordinator.defer_release
+                if self.hisparse_coordinator is not None
+                else None
+            ),
         )
 
     def maybe_init_decode_offload_manager(self) -> None:
@@ -6272,6 +6277,9 @@ class Scheduler(
         if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
+            # Before the pools are cleared: a request that has ended may still
+            # hold rows and slots (paged HiSparse waits for its last forward).
+            self.token_to_kv_pool_allocator.release_ended_requests()
             if self.uocr_runtime is not None:
                 # Before the pool clear, which returns the retained windows' KV.
                 self._abort_uocr_doc_windows(

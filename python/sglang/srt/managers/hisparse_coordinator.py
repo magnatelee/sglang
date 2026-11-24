@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import time
 import types
 import weakref
 from typing import (
     TYPE_CHECKING,
+    Callable,
     Dict,
     List,
     NamedTuple,
@@ -73,6 +75,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MiniMaxSparseKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.stream_handoff import handed_over, staged
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -175,6 +178,9 @@ class HiSparseSpecSwapManager:
     MIN_SCRATCH_CAPACITY = 1024
     NUM_METADATA_VALUES_PER_OCCURRENCE = 5
     NUM_COUNTERS_PER_REQUEST = 4
+    # Arbitrary: more blocks than arrivals between two finishes ever need.
+    MAX_SPARE_SCRATCH = 16
+    _spare_scratch = None  # (class default for managers built without __init__)
 
     def __init__(
         self,
@@ -187,6 +193,9 @@ class HiSparseSpecSwapManager:
         self.num_draft_tokens = num_draft_tokens
         self.scratch_capacity = 0
         self._scratch_reqs: set[int] = set()
+        # Scratch blocks of ended resident requests, handed to the next arrivals:
+        # an allocation below the band reads the free list back.
+        self._spare_scratch: list = []
 
         layer_num = coordinator.mem_pool_device.layer_num
         max_num_req_slots = coordinator.req_to_token_pool.req_to_token.shape[0]
@@ -310,6 +319,13 @@ class HiSparseSpecSwapManager:
         """Reserve one request's graph-stable swap workspace at admission."""
         if not self.enabled or req_pool_idx in self._scratch_reqs:
             return
+        if self._spare_scratch:
+            # Kept by a release on its own stream; this copy is queued behind the batch in flight.
+            self.req_to_scratch[:, req_pool_idx].copy_(
+                handed_over(self._spare_scratch.pop())
+            )
+            self._scratch_reqs.add(req_pool_idx)
+            return
         allocator = self._coordinator.token_to_kv_pool_allocator
         if (  # admission counted resident requests' pages as free; move pages to host to free them
             getattr(self._coordinator, "hs_spec_res", False)
@@ -343,10 +359,45 @@ class HiSparseSpecSwapManager:
         """Free scratch before any swap kernel has changed its ownership."""
         if not self.enabled or req_pool_idx not in self._scratch_reqs:
             return
+        if (
+            self._spare_scratch is not None
+            and self._coordinator.enable_resident is True
+            and len(self._spare_scratch) < self.MAX_SPARE_SCRATCH
+        ):
+            # Cloned on the stream of the release that ends the request; read by the next arrival's stream.
+            self._spare_scratch.append(
+                staged(self.req_to_scratch[0, req_pool_idx].clone())
+            )
+            self.clear_scratch(req_pool_idx)
+            return
         self._coordinator.token_to_kv_pool_allocator.free_hisparse_indices(
             self.req_to_scratch[0, req_pool_idx].clone()
         )
         self.clear_scratch(req_pool_idx)
+
+    def free_spare_scratch(self) -> bool:
+        """Device memory is short: the kept scratch blocks go back to the allocator.
+        Returns whether there were any."""
+        if not self._spare_scratch:
+            return False
+        allocator = self._coordinator.token_to_kv_pool_allocator
+        P = self._coordinator.page_size
+        while self._spare_scratch:
+            # A block that was never rotated: whole pages, in page order. Kept by a release on its own
+            # stream; nothing here reads back, so the page ids are computed when this stream gets to them.
+            block = handed_over(self._spare_scratch.pop())
+            allocator.free_device_pages(block[::P] // P)
+        return True
+
+    def spare_scratch_slots(self) -> int:
+        """Device slots of the kept blocks: free for admission, since
+        `free_spare_scratch` returns them when slots are short."""
+        return len(self._spare_scratch or ()) * self.scratch_capacity
+
+    def forget_spare_scratch(self) -> None:
+        """The allocator rebuilt its free list from every page: the kept blocks are in it."""
+        if self._spare_scratch:
+            self._spare_scratch.clear()
 
     def clear_scratch(self, req_pool_idx: int) -> None:
         if not self.enabled or req_pool_idx not in self._scratch_reqs:
@@ -670,6 +721,7 @@ class _HsUnifiedMLAHost(MLATokenToKVPoolHost):
 
 class HiSparseCoordinator:
     hs_spec_res = False  # (class default for coordinators built without __init__)
+    _recv_buffer_hold = None  # (class default) req slot -> buffer slots kept for a PD transfer
     hs_el = None  # (class default)
     _hs_verify_sel = None  # (class default)
     enable_resident = False
@@ -678,6 +730,7 @@ class HiSparseCoordinator:
     paging = None
     _resident = types.MappingProxyType({})
     _resident_steps = 0
+    _release_queue = None  # (class default)
 
     def __init__(
         self,
@@ -986,6 +1039,16 @@ class HiSparseCoordinator:
         )
         self._resident: dict = {}  # req_pool_idx -> Req
         self._resident_steps = 0
+        # Ended requests whose pages the launched forward may still touch:
+        # (req, events that end that use, the caller's release), oldest first.
+        self._release_queue: list = []
+        self._release_pending: set = set()  # their req_pool_idx
+        self._frame_wait_since: dict = {}  # rid -> first refusal (perf_counter)
+        self._frame_waits: list = []  # ms
+        self._frame_wait_count = 0
+        # Their release runs here: the scheduler's stream waits for each launched
+        # forward (its write-after-read barrier), and so would every host read on it.
+        self._release_stream = device_module.Stream()
         # Batches whose requests are all resident replay their own decode graph.
         self._hs_verify_sel = (
             None  # rows of the last verify preparation when every row was resident
@@ -1113,6 +1176,55 @@ class HiSparseCoordinator:
         for req_pool_idx in req_pool_indices:
             self.spec_swap.allocate_scratch(req_pool_idx)
 
+    def hold_buffer_slots(self, req: Req, prefill_tokens: int) -> bool:
+        """PD receive: keep, from pre-allocation on, the device slots the hot
+        buffer of a prompt that stays buffered adds to its prefill pages.
+        Admission charged them (`request_slot_reserve`). A local prefill takes
+        them one step after that check; a transfer lands many pre-allocations
+        later, and frames of transfers in flight cannot be evicted for it.
+        False when they do not fit."""
+        slots = self.token_to_kv_pool_allocator.alloc_buffer_extra(prefill_tokens)
+        if slots is None:
+            return False
+        if slots.numel() > 0:
+            if self._recv_buffer_hold is None:
+                self._recv_buffer_hold = {}
+            # Taken on the pre-allocating stream; given back by whatever stream ends or admits the request.
+            self._recv_buffer_hold[req.kv.req_pool_idx] = staged(slots)
+        return True
+
+    def _give_back_buffer_hold(self, req_pool_idx: int) -> None:
+        """The request builds its buffer now, or ends without one."""
+        held = self._recv_buffer_hold
+        if held:
+            slots = held.pop(req_pool_idx, None)
+            if slots is not None:
+                self.token_to_kv_pool_allocator.free_buffer_extra(slots)
+
+    def cancel_prealloc(self, req: Req) -> None:
+        """PD receive: a pre-allocation that got no device frames gives back
+        what it took with its request slot: speculative scratch, a buffered
+        prompt's host rows, held buffer slots."""
+        rid = req.kv.req_pool_idx
+        self._give_back_buffer_hold(rid)
+        self.spec_swap.free_unrotated_scratch(rid)
+        host_indices = self.mem_pool_host.allocated_host_indices(
+            self.req_to_host_pool, rid, self.req_to_host_pool_allocated_len[rid]
+        )
+        if host_indices.numel() > 0:
+            self.mem_pool_host.free(host_indices)
+        self.req_to_host_pool[rid, :] = -1
+        self.req_to_host_pool_allocated_len[rid] = 0
+
+    def wait_frames_quiescent(self) -> None:
+        """Block until no launched forward and no queued copy can touch a device
+        frame handed out so far: for a writer that follows no local stream (a
+        PD prefill writing a published destination)."""
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+        device_module.current_stream().synchronize()
+
     def destroy(self) -> None:
         # Drain in-flight transfers so the buffer is idle, then unregister it.
         # See HostKVCache.destroy for why the explicit unregister matters.
@@ -1140,8 +1252,9 @@ class HiSparseCoordinator:
             ),
         )
 
-    def admit_request_into_staging(self, req: Req) -> None:
-        """Start the host copy of a prefilled request and move it into staging."""
+    def admit_request_into_staging(self, req: Req, received: bool = False) -> None:
+        """Start the host copy of a prefilled request and move it into staging.
+        received: the prompt arrived by a PD transfer."""
         req.hisparse_staging = True
 
         full_kv_indices = self.req_to_token_pool.req_to_token[
@@ -1159,7 +1272,7 @@ class HiSparseCoordinator:
         ):  # the host copy's prefix if the request becomes resident
             self._hs_staged_len[req.kv.req_pool_idx] = prefill_len
         if self.hs_exclusive:
-            prefill_len = self._exclusive_staged_len(req, prefill_len)
+            prefill_len = self._exclusive_staged_len(req, prefill_len, received)
             device_indices = device_indices[:prefill_len]
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
@@ -1188,18 +1301,22 @@ class HiSparseCoordinator:
 
         move([HiSparseAct(start_event, finish_event, req)], self.ack_staging_queue)
 
-    def _exclusive_staged_len(self, req: Req, prefill_len: int) -> int:
+    def _exclusive_staged_len(self, req: Req, prefill_len: int, received: bool) -> int:
         """Exclusive placement: how much of a prefill is copied to host. All of a
-        prompt that stays buffered; the whole pages of a resident one while host
-        slots can be had without moving rows, else nothing (its pages then hold
-        no host slot until they leave the device pool)."""
+        prompt that stays buffered; the whole pages of a resident one while that
+        many host slots are free, else nothing (its pages then hold no host slot
+        until they leave the device pool). Nothing of a resident prompt that
+        arrived by a PD transfer: on a decode that copy runs against the
+        transfers landing next to it."""
         if not self._can_stay_resident(req):
             page_end = -(-prefill_len // self.page_size) * self.page_size
             held = int(self.req_to_host_pool_allocated_len[req.kv.req_pool_idx])
             self.paging.ensure_host(page_end - held, must=True)
             return prefill_len
         whole = prefill_len // self.page_size * self.page_size
-        if self.paging.ensure_host(whole, must=False):
+        # Free slots only: taking slots back from pages in the device pool would
+        # copy every arrival to host and wait for the launched forward to do it.
+        if not received and self.mem_pool_host.available_size() >= whole:
             return whole
         self.paging.xstats[5] += 1
         return 0
@@ -1287,6 +1404,8 @@ class HiSparseCoordinator:
         )
         compressed_len = len(compressed_logical_indices)
 
+        # A PD transfer kept the slots this buffer adds since its pre-allocation.
+        self._give_back_buffer_hold(req.kv.req_pool_idx)
         buffer_indices = self.token_to_kv_pool_allocator.alloc_device_buffer(
             compressed_logical_indices, alloc_size
         )
@@ -1582,8 +1701,72 @@ class HiSparseCoordinator:
                 total - held,
             )
 
+    def forget_spare_scratch(self) -> None:
+        self.spec_swap.forget_spare_scratch()
+
+    def spare_scratch_slots(self) -> int:
+        return self.spec_swap.spare_scratch_slots()
+
+    def frame_reuse_fences(self) -> list:
+        """Events a writer that follows no stream (a PD prefill) waits for before
+        it writes device frames handed out so far: a launched forward may still
+        read a frame through the page table it was launched with."""
+        if not self.enable_resident or self.decode_producer_stream is None:
+            return []
+        launched = device_module.Event()
+        launched.record(self.decode_producer_stream)
+        return [launched]
+
+    def room_without_copy(self, need_slots: int) -> bool:
+        """Paged residency: whether an arrival can take `need_slots` device slots now
+        without the loop waiting for a copy to host or for an ended request's last
+        forward. False: what is missing is on its way; ask again on a later pass."""
+        if not self.enable_resident:
+            return True
+        self.run_deferred_releases()
+        dev = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        if dev.available_size() < need_slots:
+            self.spec_swap.free_spare_scratch()
+        if dev.available_size() >= need_slots:
+            return True
+        if self._release_queue and self.decode_producer_stream is not None:
+            return False
+        return self.paging.room_without_copy(need_slots)
+
+    def note_frame_wait(self, rid: str, waited: bool) -> None:
+        """Arrivals that waited for device frames: how long, from the first refusal
+        to the pre-allocation."""
+        now = time.perf_counter()
+        if waited:
+            if len(self._frame_wait_since) >= 4096:  # requests that left while waiting
+                self._frame_wait_since.clear()
+            self._frame_wait_since.setdefault(rid, now)
+            return
+        since = self._frame_wait_since.pop(rid, None)
+        if since is None:
+            return
+        waits = self._frame_waits  # the last 1,000
+        waits.append((now - since) * 1e3)
+        self._frame_wait_count += 1
+        if self._frame_wait_count % 50 == 0:
+            ordered = sorted(waits)
+            logger.info(
+                "HiSparse paged: %d arrivals waited for device frames: mean %.1f ms, "
+                "p50 %.1f, p90 %.1f, max %.1f",
+                self._frame_wait_count,
+                sum(waits) / len(waits),
+                ordered[len(waits) // 2],
+                ordered[len(waits) * 9 // 10],
+                ordered[-1],
+            )
+            del waits[:-950]
+
     def reclaim_device(self, need_slots: int) -> bool:
         """Move cold pages to host until `need_slots` device slots are free."""
+        # An ended request's frames are free once its last forward has run: wait
+        # for that before moving anything else.
+        self.run_deferred_releases(block=True)
+        self.spec_swap.free_spare_scratch()
         return self.paging.reclaim(need_slots)
 
     # ---- elastic range ------------------------------------------------------------------------------------------------
@@ -1599,9 +1782,14 @@ class HiSparseCoordinator:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
         torch.cuda.synchronize()
+        if self.enable_resident:
+            self.paging.finish_seal(block=True)  # its frames may move
 
     def hs_el_evict_below_band(self) -> bool:
         """Make room below the band: cold pages there leave the device pool."""
+        self.run_deferred_releases(block=True)
+        if self.spec_swap.free_spare_scratch():  # kept scratch sits below the band
+            return True
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
@@ -1649,6 +1837,15 @@ class HiSparseCoordinator:
             el["row"],
             self.page_size,
         )
+        if el["pinned"]:
+            # A PD prefill writes these ranges: mapped once, nothing to lend.
+            if log:
+                logger.info(
+                    "HiSparse elastic: ranges pinned for NVLink transfers (no band; "
+                    "index keys mapped for %d logical pages)",
+                    ik.mapped // pb,
+                )
+            return
         keep_pages = self._hs_el_log_high() + el["headroom"] + 2 + keep_extra
         keep = max(0, min(ik.stride, (keep_pages + 1) * pb))
         g = ik.g
@@ -1842,7 +2039,8 @@ class HiSparseCoordinator:
             log_parts, dev_parts, off = [], [], 0
             for rid, L, pe, E in todo:
                 if pe > L:  # the rest of the device page that holds position L - 1
-                    base = mapping[r2t[rid, L - 1].to(torch.int64)]
+                    # a one-element index: a scalar one reads the slot back to the host
+                    base = mapping[r2t[rid, L - 1 : L].to(torch.int64)]
                     log_parts.append(r2t[rid, L:pe])
                     dev_parts.append(base + 1 + self._hs_arange_page[: pe - L])
                 if E > pe:
@@ -1890,7 +2088,7 @@ class HiSparseCoordinator:
         dev = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         need_pages = sum(1 for s in seq_lens_cpu.tolist() if (s - 1) % page == 0)
         if need_pages * page > dev.available_size():
-            if not self.paging.reclaim(need_pages * page):
+            if not self.reclaim_device(need_pages * page):
                 self._hs_lean[1] += 1
                 return False
         self._hs_lean[0] += 1
@@ -1968,6 +2166,7 @@ class HiSparseCoordinator:
     def move_ready_reqs(self, dst: ReqList) -> List[Req]:
         """Move the staged requests whose host copy has landed into `dst`, and
         return them."""
+        self.run_deferred_releases()
         ready_reqs: List[Req] = []
         if len(self.ack_staging_queue) == 0:
             return ready_reqs
@@ -2320,6 +2519,7 @@ class HiSparseCoordinator:
         """Free a staged request's host + device resources."""
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
+        self._give_back_buffer_hold(req.kv.req_pool_idx)
 
         prefill_len = req.extend_end
         allocated_locs = self.req_to_token_pool.req_to_token[
@@ -2341,16 +2541,81 @@ class HiSparseCoordinator:
         self.spec_swap.free_unrotated_scratch(req.kv.req_pool_idx)
         req.hisparse_staging = False
 
-    def release_request(self, req: Req):
+    def defer_release(self, req: Req, release: Callable[[], None]) -> bool:
+        """Paged residency under the overlap loop: give an ended request's pages
+        back once the forward launched before its end has run, instead of making
+        this stream (and every host read after it) wait for that forward. False:
+        the caller releases now."""
+        if not self.enable_resident or self.decode_producer_stream is None:
+            return False
+        if req.hisparse_staging:  # no forward has read its rows: released at once
+            return False
+        rid = req.kv.req_pool_idx
+        if rid in self._release_pending:  # ended again before its release ran
+            return True
+        self.run_deferred_releases()
+        # Everything queued so far on the streams that may still use its pages.
+        forward_done = device_module.Event()
+        forward_done.record(self.decode_producer_stream)
+        backup_done = device_module.Event()
+        backup_done.record(self.decode_backup_stream)
+        # And on this stream: a request that ends in the pass it was pre-allocated in has its row, its map
+        # entries and its scratch table still queued here behind the batch in flight (no launch has waited
+        # for them); so are the table writes of a seal or an eviction issued in this pass.
+        issued = device_module.Event()
+        issued.record(device_module.current_stream())
+        fences = [forward_done, backup_done, issued]
+        # A seal running now may be copying its pages; none started later will.
+        if rid in self._resident:
+            seal_done = self.paging.seal_fence()
+            if seal_done is not None:
+                fences.append(seal_done)
+            self.paging.unlist(rid)
+        self._release_pending.add(rid)
+        self._release_queue.append((req, tuple(fences), release))
+        return True
+
+    def run_deferred_releases(self, block: bool = False) -> None:
+        """Release the ended requests whose last users have run, oldest first.
+        block: wait for them (the pages are needed now, or the pools are reset).
+        Called where the loop collects its requests, so the release overlaps the
+        forward in flight, and wherever memory is short."""
+        queue = self._release_queue
+        while queue:  # None on a coordinator built without __init__
+            req, fences, release = queue[0]
+            for event in fences:
+                if not event.query():
+                    if not block:
+                        return
+                    event.synchronize()
+            if self.paging is not None:
+                # An eviction issued before this point picks its pages when its stream gets to it, and an
+                # ended request's pages are among the candidates: the release follows it, never runs beside it.
+                evicting = self.paging.evict_fence()
+                if evicting is not None:
+                    if not block:
+                        return
+                    evicting.synchronize()
+            queue.pop(0)
+            self._release_pending.discard(req.kv.req_pool_idx)
+            with device_module.stream(self._release_stream):
+                self.release_request(req, fenced=True)
+                release()
+            # Whatever the caller's stream does next with the freed slots follows.
+            device_module.current_stream().wait_stream(self._release_stream)
+
+    def release_request(self, req: Req, fenced: bool = False):
         """Free what a request holds here, whether finished, aborted or retracted."""
         if req.hisparse_staging:
             self._release_staging(req)
             return
 
         # release resources only after the execution of a potential overlapped batch
-        if self.decode_producer_stream is not None:
-            device_module.current_stream().wait_stream(self.decode_producer_stream)
-        self.wait_for_pending_backup()
+        # (fenced: the caller saw that batch and the pending backup complete)
+        if not fenced:
+            if self.decode_producer_stream is not None:
+                device_module.current_stream().wait_stream(self.decode_producer_stream)
+            self.wait_for_pending_backup()
         if self._resident and self._resident.pop(req.kv.req_pool_idx, None) is not None:
             # its device slots stay mapped; release_kv_cache frees them as it does a prefill's.
             self.req_resident[req.kv.req_pool_idx] = 0
@@ -2374,6 +2639,8 @@ class HiSparseCoordinator:
         allocated_locs = self.req_to_token_pool.req_to_token[
             req_pool_idx, :allocated_len
         ]
+        # A PD transfer that ended before its buffer was built.
+        self._give_back_buffer_hold(req_pool_idx)
 
         # The spec commit kernel rotates physical locations between each
         # layer's persistent cache and scratch.  Their current union is the

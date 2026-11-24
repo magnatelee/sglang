@@ -41,10 +41,19 @@ class VmmChunkPool:
     could be taken by PyTorch's caching allocator before the next map (cuMemCreate out of memory).
     """
 
-    def __init__(self, device_id: int):
+    def __init__(self, device_id: int, *, peer_writable: bool = False):
         self.device_id = int(device_id)
-        # Not exported to other processes, so no shareable handle type.
-        self._prop = make_device_allocation_prop(self.device_id, handle_types=None)
+        # A PD prefill imports peer-writable chunks over the NVLink fabric
+        # (Mooncake exports the handle at a registered address as FABRIC);
+        # chunks no other process maps need no shareable handle type.
+        self._prop = make_device_allocation_prop(
+            self.device_id,
+            handle_types=(
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+                if peer_writable
+                else None
+            ),
+        )
         self._access = [make_rw_access_desc(self.device_id)]
         self._mapped: Dict[int, tuple] = {}  # address -> (handle, bytes)
         self._free: Dict[int, List] = {}  # chunk bytes -> unmapped handles
@@ -88,9 +97,9 @@ class VmmChunkPool:
 
 
 @functools.cache
-def _device_chunk_pool(device_id: int) -> VmmChunkPool:
+def _device_chunk_pool(device_id: int, peer_writable: bool) -> VmmChunkPool:
     """One pool per device: a chunk the KV band gives up is the chunk the index keys map next."""
-    return VmmChunkPool(device_id)
+    return VmmChunkPool(device_id, peer_writable=peer_writable)
 
 
 def _host_numa_id(device_id: int) -> int:
@@ -131,11 +140,12 @@ class ElasticFamily:
         host_rows: int = 0,
         item: int = 0,
         page: int = 0,
+        peer_writable: bool = False,
     ):
         dev = torch.device(device)
         self.dev = dev.index if dev.index is not None else torch.cuda.current_device()
         with torch.cuda.device(self.dev):
-            self.x = _device_chunk_pool(self.dev)
+            self.x = _device_chunk_pool(self.dev, peer_writable)
             self.g = get_device_granularity(self.dev)
             self.layers, self.name = layers, name
             # bytes of a layer that chunks of the pool can back

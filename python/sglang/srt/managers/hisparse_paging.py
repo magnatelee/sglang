@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import collections
 import logging
 from typing import TYPE_CHECKING
 
@@ -9,6 +10,7 @@ import torch
 from sglang.kernels.ops.kvcache import hisparse_paging as paging_kernels
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.graph_variants import HISPARSE_RESIDENT
+from sglang.srt.mem_cache.stream_handoff import handed_over, staged
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
 )
@@ -23,6 +25,81 @@ device_module = get_device_module()
 logger = logging.getLogger(__name__)
 
 
+def picks_without_host_copy(
+    *,
+    picks: torch.Tensor,
+    candidates: torch.Tensor,
+    frame_lp: torch.Tensor,
+    host_first: torch.Tensor,
+) -> torch.Tensor:
+    """How many of an eviction's picks are not evictable frames whose page has its host slot."""
+    lp = frame_lp[picks]
+    return (~candidates[picks] | (lp < 0) | (host_first[lp] < 0)).sum()
+
+
+def home_host_pages(
+    *, frame_lp: torch.Tensor, host_first: torch.Tensor, page_size: int, num_host_pages: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per frame: (the host page of its home page, whether that page has a host slot), from ONE read of the
+    host-slot table. A frame without a home page, or whose page has no slot, gets host page 0 and False."""
+    home_slot = host_first[frame_lp.clamp(min=0)]
+    return (home_slot // page_size).clamp(min=0, max=num_host_pages - 1), home_slot >= 0
+
+
+def guest_frames_eligible(
+    *, evictable: torch.Tensor, has_host: torch.Tensor, group_state: torch.Tensor
+) -> torch.Tensor:
+    """[groups, frames]: frames a group may put a guest in. A home page in place (state -2) must be evictable
+    AND have had its host slot in the read that gave its host page; a frame already away (>= -1) is free to take."""
+    return (evictable[None, :] & has_host[None, :] & (group_state == -2)) | (group_state >= -1)
+
+
+def home_victims_without_host_slot(
+    *, home: torch.Tensor, frames: torch.Tensor, has_host: torch.Tensor
+) -> torch.Tensor:
+    """How many home pages a group tick redirects to host although they had no host slot when it planned."""
+    return (home & ~has_host[frames]).sum()
+
+
+def frames_not_free_for_registration(
+    *,
+    dev_first: torch.Tensor,
+    page_size: int,
+    frame_lp: torch.Tensor,
+    evictable: torch.Tensor,
+    exclusive: torch.Tensor | None,
+) -> torch.Tensor:
+    """How many of the pages to be registered (their first device rows) are not in a device frame of their
+    own: outside the frames, or in a frame that still holds a registered page or its flags."""
+    num_frames = frame_lp.numel()
+    outside = (dev_first < page_size) | (dev_first >= num_frames * page_size)
+    frames = (dev_first // page_size).clamp(0, num_frames - 1)
+    used = (frame_lp[frames] >= 0) | evictable[frames]
+    if exclusive is not None:
+        used = used | exclusive[frames]
+    return (outside | used).sum()
+
+
+def pages_not_in_their_frames(
+    *,
+    first: torch.Tensor,
+    dev_first: torch.Tensor,
+    frame_lp: torch.Tensor,
+    page_size: int,
+    host_row0: int,
+) -> torch.Tensor:
+    """[pages] bool: registered pages (first logical slots, their map entries) that the map places in the
+    device pool but not in the frame registered for them: the padding page, a row between the frames and the
+    host rows, or a frame that holds another page (or none)."""
+    num_frames = frame_lp.numel()
+    frame = (dev_first // page_size).clamp(0, num_frames - 1)
+    return (dev_first < host_row0) & (
+        (dev_first < page_size)
+        | (dev_first >= num_frames * page_size)
+        | (frame_lp[frame] != first // page_size)
+    )
+
+
 class HiSparsePagingManager:
     """Where the pages of resident HiSparse requests live.
 
@@ -34,9 +111,23 @@ class HiSparsePagingManager:
     the all-resident decode graph keeps selected host rows in a row cache.
     """
 
+    # Guards: invariants whose breach means a running request reads rows that are not its own. Where the
+    # call may not read back (its stream is fenced behind the batch in flight) the count is taken on that
+    # stream into pinned memory and read once the stream has run it (`check_guards`, every step).
+    GUARD_SLOTS = 256
+    _guard_counts = None  # (class default for managers built without __init__: no guard)
+
     def __init__(self, coordinator: HiSparseCoordinator):
         self._coordinator = coordinator
         device = coordinator.device
+        self._guard_counts = torch.zeros(
+            self.GUARD_SLOTS,
+            dtype=torch.int64,
+            pin_memory=torch.device(device).type == "cuda",
+        )
+        self._guard_pending = collections.deque()  # (what, slot, event, context)
+        self._guard_serial = 0
+        self.guard_breaches: dict = {}
         P = coordinator.page_size
         va = coordinator.mem_pool_device._hs_va
         self.host_row0 = int(va.host_row0(0))
@@ -103,6 +194,27 @@ class HiSparsePagingManager:
             # logical page -> request slot and page index in the request
             self.lp_rid = torch.zeros(log_pages, dtype=torch.int64, device=device)
             self.lp_pos = torch.zeros(log_pages, dtype=torch.int64, device=device)
+            # logical page -> a whole page of the prompt its request arrived with:
+            # nothing writes it again
+            self.lp_prompt = torch.zeros(log_pages, dtype=torch.bool, device=device)
+            self._seal_stream = device_module.Stream()
+            # prompt pages sealed beside the in-flight batch: calls, pages
+            self.early_seals = [0, 0]
+            # The one seal whose copy is still running; its pages stay exclusive until `finish_seal`.
+            self._seal_pending = None
+            self._seal_serial = 0
+            # request slot -> serial of the last seal started before its pages left the candidates
+            self._seal_unlisted: dict = {}
+            # no exclusive prompt page was left at the last pick
+            self._seal_dry = False
+            # Pinned: a pageable copy would make the stream wait for the batch in flight.
+            self._pin = torch.device(device).type == "cuda"
+            self._pin_keep = collections.deque(maxlen=8)
+            self._seal_ok_pin = torch.empty(
+                self.num_device_pages, dtype=torch.bool, pin_memory=self._pin
+            )
+        # The last eviction's completion on the stream that issued it; None once it has run.
+        self._evict_done = None
         self._stream = device_module.Stream()
         self._tick_steps = max(1, int(envs.SGLANG_HISPARSE_PAGED_TICK_STEPS.get()))
         self._hyst = float(envs.SGLANG_HISPARSE_PAGED_HYST.get())
@@ -285,9 +397,47 @@ class HiSparsePagingManager:
             / 2**20,
         )
 
+    def _guard(self, what: str, count: torch.Tensor, context: str) -> None:
+        """`count` (a device scalar made on the current stream) must be zero: checked without waiting for it."""
+        if self._guard_counts is None:
+            return
+        if len(self._guard_pending) >= self.GUARD_SLOTS:  # the oldest slot is about to be written again
+            self._guard_pending[0][2].synchronize()
+            self.check_guards()
+        slot = self._guard_serial % self.GUARD_SLOTS
+        self._guard_serial += 1
+        self._guard_counts[slot : slot + 1].copy_(count.reshape(1), non_blocking=True)
+        done = device_module.Event()
+        done.record(device_module.current_stream())
+        self._guard_pending.append((what, slot, done, context))
+
+    def check_guards(self) -> None:
+        """Raise on the first guard whose stream has run it and found a breach."""
+        pending = self._guard_pending
+        while pending and pending[0][2].query():
+            what, slot, _, context = pending.popleft()
+            count = int(self._guard_counts[slot])
+            if count:
+                self._guard_breach(what, count, context)
+
+    def _guard_breach(self, what: str, count: int, context: str) -> None:
+        self.guard_breaches[what] = self.guard_breaches.get(what, 0) + 1
+        message = (
+            f"HiSparse paged: {what}: {count} ({context}); step {self._steps}, "
+            f"{self.num_evictable_pages} evictable and "
+            f"{self.num_exclusive_pages if self.exclusive else 0} exclusive pages registered, "
+            f"{self._n_onhost} on host, {len(self.registered_len)} requests registered. "
+            "Rows of running requests are no longer their own: stopping."
+        )
+        logger.error(message)
+        raise RuntimeError(message)
+
     def step(self) -> None:
         """One decode or verify step: the scores' clock, and the group moves it paces."""
         self._steps += 1
+        if self._guard_counts is not None:
+            self.check_guards()
+        self.finish_seal()
         if self._coordinator._resident:
             self._gtick()
         if self._steps % 2000 == 0:
@@ -309,7 +459,7 @@ class HiSparsePagingManager:
         P = coordinator.page_size
         start = self.registered_len[rid]
         if self.exclusive:
-            self._register_exclusive(rid, req)
+            self._register_exclusive(rid, req, prompt=True)
             return
         end = min(coordinator._hs_staged_len[rid], self.sealable_end(req)) // P * P
         if end <= start:
@@ -348,7 +498,19 @@ class HiSparsePagingManager:
                 raise RuntimeError(
                     f"HiSparse paged: pages of request slot {rid} [{start}, {end}) are not aligned"
                 )
-        frames = dev_first // P
+        self._guard(
+            "a request's pages were registered on frames that are not free",
+            frames_not_free_for_registration(
+                dev_first=dev_first,
+                page_size=P,
+                frame_lp=self.frame_lp,
+                evictable=self.evictable,
+                exclusive=None,
+            ),
+            f"request slot {rid}, pages [{start // P}, {end // P})",
+        )
+        # (clamped: a row outside the frames is the guard's finding, not an index error)
+        frames = (dev_first // P).clamp(0, self.num_device_pages - 1)
         prior = (self.score * self.evictable).sum() / self.evictable.sum().clamp(min=1)
         self.frame_lp[frames] = first // P
         self.host_first[first // P] = host_first
@@ -372,9 +534,10 @@ class HiSparsePagingManager:
     # (the map names its host rows). A host slot is released only while the page's
     # rows are complete in its frame for every layer group; a frame is freed only
     # once the host copy was launched ahead of every later reader on the streams.
-    def _register_exclusive(self, rid: int, req: Req) -> None:
+    def _register_exclusive(self, rid: int, req: Req, prompt: bool = False) -> None:
         """Track the whole pages [registered, end) of resident request `rid`: those staged to host as evictable, the
-        others as exclusive. They are in HBM: a page leaves HBM only after it was registered."""
+        others as exclusive. They are in HBM: a page leaves HBM only after it was registered. prompt: the request
+        has just arrived, so these are pages of its prompt."""
         coordinator = self._coordinator
         P = coordinator.page_size
         start = self.registered_len[rid]
@@ -423,7 +586,21 @@ class HiSparsePagingManager:
                 raise RuntimeError(
                     f"HiSparse paged: pages of request slot {rid} [{start}, {end}) are not aligned"
                 )
-        frames = dev_first // P
+        # A frame handed out while its previous owner still used it would now hold two pages: both requests
+        # read one set of rows, and the first owner's flags decide what an eviction does with the second's page.
+        self._guard(
+            "a request's pages were registered on frames that are not free",
+            frames_not_free_for_registration(
+                dev_first=dev_first,
+                page_size=P,
+                frame_lp=self.frame_lp,
+                evictable=self.evictable,
+                exclusive=self.xframe,
+            ),
+            f"request slot {rid}, pages [{start // P}, {end // P})",
+        )
+        # (clamped: a row outside the frames is the guard's finding, not an index error)
+        frames = (dev_first // P).clamp(0, self.num_device_pages - 1)
         lp = first // P
         tracked = self.evictable | self.xframe
         prior = (self.score * tracked).sum() / tracked.sum().clamp(min=1)
@@ -433,6 +610,7 @@ class HiSparsePagingManager:
         self.lp_pos[lp] = torch.arange(
             start // P, end // P, dtype=torch.int64, device=lp.device
         )
+        self.lp_prompt[lp] = prompt
         self.score[frames] = prior
         D = self.num_device_pages
         tr = tracked[None, :]
@@ -444,6 +622,8 @@ class HiSparsePagingManager:
         self.registered_len[rid] = end
         self.num_evictable_pages += num_staged
         self.num_exclusive_pages += num_pages - num_staged
+        if prompt and num_pages > num_staged:
+            self._seal_dry = False
 
     def track_all(self) -> None:
         """Register every resident request's pages that became whole pages below its writing position."""
@@ -516,6 +696,7 @@ class HiSparsePagingManager:
         coordinator = self._coordinator
         P = coordinator.page_size
         host = coordinator.mem_pool_host
+        self.finish_seal(block=True)  # its pages still read as exclusive
         k = min(int(n_pages), self.num_exclusive_pages, host.available_size() // P)
         if k <= 0:
             return 0
@@ -564,11 +745,160 @@ class HiSparsePagingManager:
         self.xstats[0] += k
         return k
 
+    def room_without_copy(self, need_slots: int) -> bool:
+        """Exclusive placement, overlap loop: whether `need_slots` device slots are free or `reclaim` can free them
+        without this stream waiting for a copy, i.e. by evicting pages whose host copy is complete. If not, the
+        copy of what is missing is started beside the running steps and the caller asks again on a later pass.
+        When nothing can be copied that way: True if the blocking reclaim can cover it (decode pages, host slots
+        of hot pages), else False (frames come back when requests end or arrive)."""
+        coordinator = self._coordinator
+        P = coordinator.page_size
+        dev = coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator
+        short = need_slots - dev.available_size()
+        if short <= 0 or not self.exclusive or coordinator.decode_producer_stream is None:
+            return True
+        self.finish_seal()
+        need_pages = -(-short // P)
+        if self.num_evictable_pages >= need_pages:
+            return self._gfinish(block=False)  # an eviction needs no group move in flight
+        if self._seal_pending is not None:
+            return False
+        if not self._seal_dry and self._seal_prompt_pages(
+            max(need_pages - self.num_evictable_pages, self.evict_batch_pages)
+        ):
+            return False
+        host_pages = coordinator.mem_pool_host.available_size() // P
+        sealable = self.num_exclusive_pages + self.untracked_sealable_pages()
+        return self.num_evictable_pages + min(sealable, host_pages) >= need_pages
+
+    def _seal_prompt_pages(self, n_pages: int) -> bool:
+        """Start the copy to host of the n coldest exclusive pages that are whole pages of an arrived prompt, on a
+        stream of their own, and return without waiting (True: started). No launched step writes such a page
+        (decode appends behind the prompt) and none sees the seal: the pages stay exclusive in their frames until
+        `finish_seal` finds the copy complete. One copy at a time; only free host slots are used."""
+        coordinator = self._coordinator
+        P = coordinator.page_size
+        host = coordinator.mem_pool_host
+        k = min(int(n_pages), self.num_exclusive_pages, host.available_size() // P)
+        if k <= 0 or self._seal_pending is not None:
+            return False
+        # Picked on the caller's stream: after every registration, seal and release issued so far. `ok` masks
+        # picks that are not such pages (fewer than k are left); their rows are copied and dropped.
+        cand = self.xframe & self.lp_prompt[self.frame_lp.clamp(min=0)]
+        sel = torch.topk(
+            torch.where(cand, self.score, torch.full_like(self.score, float("inf"))),
+            k,
+            largest=False,
+        ).indices
+        ok = cand[sel]
+        lp = staged(self.frame_lp[sel])
+        staged(sel)  # both are read where the seal takes effect, on the release stream
+        self._seal_ok_pin[:k].copy_(ok, non_blocking=True)
+        host_locs = host.alloc(k * P)
+        cur = device_module.current_stream()
+        with device_module.stream(self._seal_stream):
+            self._seal_stream.wait_stream(cur)
+            # Filled on the copy's own stream and kept until it has completed: the copy kernel
+            # reads its index tensors while it runs.
+            host_dev = self._to_device(host_locs)
+            dev_slots = self._page_slots(sel * P)
+            host.backup_from_device_all_layer(
+                coordinator.mem_pool_device, host_dev, dev_slots, io_backend="kernel"
+            )
+            done = device_module.Event()
+            done.record(self._seal_stream)
+        self._seal_serial += 1
+        self._seal_pending = (
+            done,
+            sel,
+            lp,
+            host_locs,
+            k,
+            self._seal_serial,
+            (host_dev, dev_slots),
+        )
+        return True
+
+    def finish_seal(self, block: bool = False) -> bool:
+        """The started seal takes effect once its copy has completed: its pages get their host slots and become
+        evictable. False while the copy runs (block: wait for it)."""
+        if not self.exclusive or self._seal_pending is None:
+            return True
+        done, sel, lp, host_locs, k = self._seal_pending[:5]
+        if not done.query():
+            if not block:
+                return False
+            done.synchronize()
+        self._seal_pending = None
+        coordinator = self._coordinator
+        P = coordinator.page_size
+        ok = self._seal_ok_pin[:k]
+        keep = torch.nonzero(ok).squeeze(1)
+        n = int(keep.numel())
+        if n < k:
+            self._seal_dry = True
+            coordinator.mem_pool_host.free(host_locs.view(k, P)[~ok].reshape(-1))
+        if n == 0:
+            return True
+        # On the release stream, which never waits for the batch in flight: a deferred release
+        # (same stream) and whatever this stream does next see the pages as sealed.
+        cur = device_module.current_stream()
+        with device_module.stream(coordinator._release_stream):
+            # Picked on the stream that started the seal.
+            sel, lp = handed_over(sel), handed_over(lp)
+            if n < k:
+                idx = self._to_device(keep)
+                sel, lp = sel[idx], lp[idx]
+            host_first = self._to_device(host_locs.view(k, P)[keep, 0].contiguous())
+            if self._check and bool((self.host_first[lp] != -1).any()):
+                raise RuntimeError("HiSparse paged: a sealed page already had host slots")
+            # Slot before flag: an eviction's pick and a group tick queued on other streams read the flags
+            # and the slots in separate kernels (`evict`, `_gtick`).
+            self._set_host_slots(lp, host_first)
+            self.gscore[:, self.num_device_pages + host_first // P] = 0
+            self.xframe[sel] = False
+            self.evictable[sel] = True
+        cur.wait_stream(coordinator._release_stream)
+        self.num_exclusive_pages -= n
+        self.num_evictable_pages += n
+        self.stats[2] += 1
+        self.stats[3] += n * P
+        self.xstats[0] += n
+        self.early_seals[0] += 1
+        self.early_seals[1] += n
+        return True
+
+    def _to_device(self, cpu: torch.Tensor) -> torch.Tensor:
+        if self._pin:
+            cpu = cpu.pin_memory()
+            # Alive until two more seals have completed: the copy below has run by then.
+            self._pin_keep.append(cpu)
+        return cpu.to(self._coordinator.device, non_blocking=True)
+
+    def seal_fence(self):
+        """The running seal's completion event (None: no seal is running)."""
+        if not self.exclusive or self._seal_pending is None:
+            return None
+        return self._seal_pending[0]
+
+    def unlist(self, rid: int) -> None:
+        """A request ended and its release is deferred: its pages are no seal candidates from here on, so only a
+        seal started before this can hold them (the release is fenced on that one)."""
+        if not self.exclusive:
+            return
+        end = self.registered_len.get(rid, 0)
+        if end > 0:
+            P = self._coordinator.page_size
+            first = self._coordinator.req_to_token_pool.req_to_token[rid, 0:end:P]
+            self.lp_prompt[first.to(torch.int64) // P] = False
+        self._seal_unlisted[rid] = self._seal_serial
+
     def _seal_coldest(self, n_pages: int) -> None:
         """Before an eviction of n pages: the exclusive pages among the n coldest registered pages get a host slot
         and their copy, so that the coldest pages leave whatever their state. The slots are free ones first, then
         those of the hottest pages that have one (they stay in HBM, exclusive from then on)."""
         coordinator = self._coordinator
+        self.finish_seal(block=True)
         self.track_all()
         k = min(int(n_pages), self.num_evictable_pages + self.num_exclusive_pages)
         if k <= 0 or self.num_exclusive_pages <= 0:
@@ -677,6 +1007,7 @@ class HiSparsePagingManager:
         self.num_exclusive_pages += k
         coordinator.mem_pool_host.free(self._page_slots(host_first))
         self.xstats[1] += k
+        self._seal_dry = False
         return k
 
     def promote(self, n_pages: int) -> int:
@@ -730,6 +1061,7 @@ class HiSparsePagingManager:
         coordinator._hs_pt_memo = None
         coordinator.mem_pool_host.free(self._page_slots(host_first))
         self.xstats[3] += k
+        self._seal_dry = False
         return k
 
     def ensure_host(self, need_slots: int, must: bool) -> bool:
@@ -737,6 +1069,11 @@ class HiSparsePagingManager:
         (a buffered request's host rows), also after copying rows back into frames, and by moving pages from host
         into free frames."""
         coordinator = self._coordinator
+        short = need_slots - coordinator.mem_pool_host.available_size()
+        if short <= 0:
+            return True
+        # An ended request's host slots come back once its last forward has run.
+        coordinator.run_deferred_releases(block=True)
         short = need_slots - coordinator.mem_pool_host.available_size()
         if short <= 0:
             return True
@@ -775,6 +1112,7 @@ class HiSparsePagingManager:
         coordinator = self._coordinator
         P = coordinator.page_size
         alloc = coordinator.token_to_kv_pool_allocator
+        self.finish_seal(block=True)
         fr = torch.arange(self.xframe.numel(), device=self.xframe.device)
         cand = self.xframe & (fr < floor_frame)
         k = min(int(n_pages), int(cand.sum()))
@@ -1084,6 +1422,8 @@ class HiSparsePagingManager:
             if not block:
                 return False
             ev.synchronize()
+        # Planned on the stream that started the move; a release completes it on its own.
+        fr, hp, back, ok = (handed_over(t) for t in (fr, hp, back, ok))
         D, H = self.num_device_pages, self._host_pages
         T = D + H
         rows = self._grows
@@ -1126,9 +1466,17 @@ class HiSparsePagingManager:
         sc = self.gscore
         inf = float("inf")
         rows = self._grows
-        home_hp = (self.host_first[self.frame_lp.clamp(min=0)] // P).clamp(
-            min=0, max=H - 1
+        # This plan runs when the schedule stream gets to it, behind the forward in flight; a background seal
+        # can take effect on the release stream meanwhile (slot first, then the evictable flag). The host page
+        # and "has a host slot" therefore come from one read, and a frame flagged evictable later without a
+        # slot in that read is left to the next tick: it would be redirected to host page 0.
+        home_hp, has_host = home_host_pages(
+            frame_lp=self.frame_lp, host_first=self.host_first, page_size=P, num_host_pages=H
         )  # [D]
+        # A release that runs meanwhile clears a frame's evictable flag, then its page, and only then waits
+        # for this tick (`_gfinish(block=True)`) and drops the frame's group state: read here with its page
+        # still set the frame is at worst taken and dropped again, read with its page cleared it has no slot.
+        # That rests on the ORDER of the release's writes (flag, page, wait); keep it.
         sinkT = lambda mask, idx: torch.where(mask, idx, torch.full_like(idx, T))
         sinkH = lambda mask, idx: torch.where(mask, idx, torch.full_like(idx, H))
         sinkD = lambda mask, idx: torch.where(mask, idx, torch.full_like(idx, D))
@@ -1166,7 +1514,9 @@ class HiSparsePagingManager:
             m,
             dim=1,
         )
-        elig = (self.evictable[None, :] & (st == -2)) | (st >= -1)
+        elig = guest_frames_eligible(
+            evictable=self.evictable, has_host=has_host, group_state=st
+        )
         cs = torch.where(
             elig,
             torch.where(st == -1, torch.full_like(sc[:, :D], -1.0), sc[:, :D]),
@@ -1182,6 +1532,11 @@ class HiSparsePagingManager:
         ha, fa = hot.indices, cold.indices
         sa = st.gather(1, fa)
         home = oka & (sa == -2)
+        self._guard(
+            "a group tick redirected a home page that has no host slot",
+            home_victims_without_host_slot(home=home, frames=fa, has_host=has_host),
+            "group tick",
+        )
         isg = oka & (sa >= 0)
         vhp = torch.where(
             sa == -2, home_hp[fa], torch.where(sa >= 0, sa, torch.full_like(sa, H))
@@ -1234,10 +1589,10 @@ class HiSparsePagingManager:
             ev.record(self._stream)
         self._gpending = (
             ev,
-            fr,
-            hp,
-            back,
-            ok,
+            staged(fr),
+            staged(hp),
+            staged(back),
+            staged(ok),
             src,
             dst,
             okf,
@@ -1276,13 +1631,14 @@ class HiSparsePagingManager:
                 "HiSparse paged exclusive: %d pages in HBM without a host slot, %d with one, %d on host; "
                 "host slots free %d of %d; [pages sealed for eviction, host slots given up, of those after a "
                 "copy back, pages promoted, frames moved in band take-backs, staging copies skipped, frames moved "
-                "up into the band] %s",
+                "up into the band] %s; prompt pages sealed beside the running step [calls, pages] %s",
                 self.num_exclusive_pages,
                 self.num_evictable_pages,
                 self._n_onhost,
                 coordinator.mem_pool_host.available_size(),
                 coordinator.mem_pool_host.size,
                 self.xstats,
+                self.early_seals,
             )
         if self._rc_rows:
             a = [int(v) for v in self.rc_stat.tolist()]
@@ -1317,9 +1673,25 @@ class HiSparsePagingManager:
             k = min(k, int(cand.sum()))
             if k <= 0:
                 return 0
+        # These reads run when this stream gets to them. The flags are read first (the pick), the host slots
+        # after; a background seal that takes effect meanwhile writes a page's slot BEFORE its flag, so a
+        # frame picked as evictable has its slot in the later read. That rests on the ORDER of `finish_seal`'s
+        # writes; the guard below counts a pick without a slot.
         score = torch.where(cand, self.score, torch.full_like(self.score, float("inf")))
         sel = torch.topk(score, k, largest=False).indices
         lp = self.frame_lp[sel]
+        # k comes from the host's counter, the pick from the flags: with fewer candidates than k the pick
+        # fills up with frames that are not evictable, and their pages would leave HBM without a host copy.
+        self._guard(
+            "an eviction took pages that have no host copy",
+            picks_without_host_copy(
+                picks=sel,
+                candidates=cand,
+                frame_lp=self.frame_lp,
+                host_first=self.host_first,
+            ),
+            f"eviction of {k} pages",
+        )
         ar = self._arange
         mapping = (
             coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
@@ -1331,11 +1703,15 @@ class HiSparsePagingManager:
         self._gdrop(sel, hp)
         self.evictable[sel] = False
         self.frame_lp[sel] = -1
-        coordinator.token_to_kv_pool_allocator.free_hisparse_indices(
-            (sel[:, None] * P + ar[None, :]).reshape(-1)
-        )
+        # Registered frames: whole pages, never page zero.
+        coordinator.token_to_kv_pool_allocator.free_device_pages(sel)
         self.num_evictable_pages -= k
         self._n_onhost += k
+        # Nothing above reads back, so the picks and the map writes run when this stream gets to them.
+        # A release on another stream must not read the map or free frames before that: `evict_fence`.
+        done = device_module.Event()
+        done.record(device_module.current_stream())
+        self._evict_done = done
         coordinator._hs_pt_memo = None
         self.stats[0] += 1
         self.stats[1] += k
@@ -1343,34 +1719,69 @@ class HiSparsePagingManager:
             self._log()
         return k
 
+    def evict_fence(self):
+        """The event behind the last eviction while its picks and map writes are still queued, else None.
+        Until it has passed, the frames it frees and the map entries it rewrites are not decided: a release
+        that ran now would free the same frames again (both read a page as in its frame)."""
+        done = self._evict_done
+        if done is None:
+            return None
+        if done.query():
+            self._evict_done = None
+            return None
+        return done
+
     def reclaim(self, need_slots: int) -> bool:
-        """Free device slots by evicting cold pages (sealing decode pages first when the sealed ones do not cover it)."""
+        """Free device slots by evicting cold pages. Exclusive placement: pages whose host copy is complete when
+        they cover it (no copy, nothing to wait for); otherwise the coldest pages whatever their state, after
+        sealing them on this stream. Else: sealing decode pages first when the sealed ones do not cover it."""
         coordinator = self._coordinator
         dev = coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator
         short = need_slots - dev.available_size()
         if short <= 0:
             return True
+        need_pages = -(-short // coordinator.page_size)
         # Ordered after the in-flight batch (it may still read or write these pages) and after the pending host backup.
         if coordinator.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(
                 coordinator.decode_producer_stream
             )
         coordinator.wait_for_pending_backup()
-        need_pages = -(-short // coordinator.page_size)
         if self.exclusive:
-            self._seal_coldest(max(need_pages, self.evict_batch_pages))
+            self.finish_seal()
+            if self.num_evictable_pages < need_pages:
+                self._seal_coldest(max(need_pages, self.evict_batch_pages))
         elif self.num_evictable_pages < need_pages:
             self.seal_all()
         self.evict(max(need_pages, self.evict_batch_pages))
         ok = dev.available_size() >= need_slots
         if not ok:
             self.stats[4] += 1
+            logger.warning(
+                "HiSparse paged: reclaim of %d slots left %d free (%d short); %d evictable and %d exclusive pages "
+                "registered, %d on host, host slots free %d, seal running %s",
+                need_slots,
+                dev.available_size(),
+                need_slots - dev.available_size(),
+                self.num_evictable_pages,
+                self.num_exclusive_pages if self.exclusive else 0,
+                self._n_onhost,
+                coordinator.mem_pool_host.available_size(),
+                self.exclusive and self._seal_pending is not None,
+            )
         return ok
 
     def release(self, rid: int) -> None:
         """A resident request ends: its pages are no longer eviction candidates (its frames are freed by the allocator,
         through the map; pages on host hold no frame)."""
         coordinator = self._coordinator
+        if self.exclusive:
+            # A seal started after the request left the candidates holds none of its pages.
+            unlisted = self._seal_unlisted.pop(rid, None)
+            pending = self._seal_pending
+            self.finish_seal(
+                block=pending is not None and (unlisted is None or pending[5] <= unlisted)
+            )
         end = self.registered_len.pop(rid, 0)
         if end <= 0:
             return
@@ -1380,6 +1791,27 @@ class HiSparsePagingManager:
         )
         first = coordinator.req_to_token_pool.req_to_token[rid, 0:end:P].to(torch.int64)
         dev_first = mapping[first]
+        # Read back on this stream (it never waits for the batch in flight), before the frame tables are
+        # indexed with what the map says: a page that is not in its own frame was read from another's rows.
+        astray = pages_not_in_their_frames(
+            first=first,
+            dev_first=dev_first,
+            frame_lp=self.frame_lp,
+            page_size=P,
+            host_row0=self.host_row0,
+        )
+        num_astray = int(astray.sum())
+        if num_astray:
+            pages = torch.nonzero(astray).squeeze(1)[:8]
+            frame = (dev_first[pages] // P).clamp(0, self.num_device_pages - 1)
+            self.registered_len[rid] = end
+            self._guard_breach(
+                "an ending request's pages are not in the frames registered for them",
+                num_astray,
+                f"request slot {rid} with {end // P} registered pages; first (page of the request, "
+                f"logical slot, map entry, page registered on that frame): "
+                f"{list(zip(pages.tolist(), first[pages].tolist(), dev_first[pages].tolist(), self.frame_lp[frame].tolist()))}",
+            )
         on_dev = dev_first < self.host_row0
         frames = dev_first[on_dev] // P
         num_exclusive = 0
@@ -1390,6 +1822,8 @@ class HiSparsePagingManager:
             self.num_exclusive_pages -= num_exclusive
             # only the pages that hold a host slot have group state on host pages
             first = first[self.host_first[first // P] >= 0]
+        # Flag, then page, then the wait for the pending group move below: a tick queued on the schedule
+        # stream may read them in between (`_gtick`).
         self.evictable[frames] = False
         self.frame_lp[frames] = -1
         hp = self.host_first[first // P] // P

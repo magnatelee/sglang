@@ -99,6 +99,8 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         self._hs_el = None
         self._hs_ratio = host_to_device_ratio
         self._hs_va = None
+        # Whether a PD prefill can write the pool's device rows and index keys.
+        self.hs_peer_writable = False
         # The host pool's tokens over the device pool's: the logical ratio unless
         # exclusive placement names a smaller host pool.
         self._hs_host_ratio = host_to_device_ratio
@@ -170,6 +172,11 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         row = self.kv_cache_dim * torch._utils._element_size(self.store_dtype)
         E = el["n_ik"] * el["ik_pages"] * el["ik_page_bytes"]
         band_max = E // (self.layer_num * row) // self.page_size * self.page_size
+        self.hs_peer_writable = self._nvlink_transfer_pool()
+        if self.hs_peer_writable:
+            # The transport imports one allocation per registered range, once:
+            # no rows that are mapped and unmapped at run time.
+            band_max = 0
         rows_max = self.size + band_max + self.page_size
         # The host pool's rows follow in the same range: MLATokenToKVPoolHost.size
         # for device_capacity_tokens=self.size (pool_host/base.py).
@@ -185,6 +192,7 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
             host_rows=host_rows,
             item=row,
             page=self.page_size,
+            peer_writable=self.hs_peer_writable,
         )
         self._hs_va = fam
         el.update(
@@ -194,6 +202,8 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
             k_min=self.size,
             k_max=self.size + band_max,
             kv=fam,
+            # Ranges mapped once at start: no band, every index key backed.
+            pinned=self.hs_peer_writable,
         )
         self.kv_buffer = [
             fam.view(l, rows_max * row)
@@ -221,11 +231,30 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
 
         pages, page_bytes = el["ik_pages"], el["ik_page_bytes"]
         ik_layers = [i for i in range(self.layer_num) if not self.skip_topk_layers[i]]
-        fam = ElasticFamily(self.device, len(ik_layers), pages * page_bytes, 0, "ik")
+        fam = ElasticFamily(
+            self.device,
+            len(ik_layers),
+            pages * page_bytes,
+            pages * page_bytes if el["pinned"] else 0,
+            "ik",
+            peer_writable=el["pinned"],
+        )
         # Graph capture writes dummy keys into the first pages.
         fam.grow_to((el["headroom"] + 2) * page_bytes)
         el.update(ik=fam, ik_layers=ik_layers)
         return _MappedIndexKeyCache(self, self.index_buf_size, fam)
+
+    def _nvlink_transfer_pool(self) -> bool:
+        """Whether this worker's pools are NVLink transfer targets (a PD worker
+        started with SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK)."""
+        if not self.enable_custom_mem_pool:
+            return False
+        from sglang.srt.disaggregation.mooncake.utils import (
+            check_mooncake_custom_mem_pool_enabled,
+        )
+
+        _, pool_type = check_mooncake_custom_mem_pool_enabled()
+        return pool_type == "NVLINK"
 
     # ---- paged residency: the host pool and attention's index space in the KV family's range ---------------------------
     def hs_host_region(

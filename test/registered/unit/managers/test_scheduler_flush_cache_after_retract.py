@@ -100,6 +100,22 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.req_to_token_pool.clear.assert_called_once()
         scheduler.token_to_kv_pool_allocator.clear.assert_called_once()
 
+    def test_flush_releases_ended_hisparse_requests_before_the_pools_are_cleared(
+        self,
+    ):
+        # Paged HiSparse releases an ended request once its last forward has run;
+        # one still pending owns a request row and KV slots.
+        scheduler = self._new_scheduler()
+        order = []
+        scheduler.token_to_kv_pool_allocator.release_ended_requests.side_effect = (
+            lambda: order.append("release")
+        )
+        scheduler.tree_cache.reset.side_effect = lambda: order.append("tree")
+        scheduler.req_to_token_pool.clear.side_effect = lambda: order.append("rows")
+
+        self.assertTrue(scheduler.flush_cache())
+        self.assertEqual(order, ["release", "tree", "rows"])
+
     def test_paused_flush_refuses_waiting_req_holding_kv(self):
         """A PD-decode request whose KV has arrived waits holding its request
         row; a paused flush would free KV it still owns."""

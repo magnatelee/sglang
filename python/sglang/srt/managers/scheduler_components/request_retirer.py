@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional
 
 from sglang.srt.environ import envs
@@ -44,10 +45,13 @@ class RequestRetirer:
         uocr_runtime: Optional[UocrSchedulerRuntime],
         send_abort_output: Callable[[AbortReq, Req], None],
         stream_output: Callable[..., None],
+        defer_hisparse_release: Optional[Callable[..., bool]] = None,
     ):
         self.tree_cache = tree_cache
         self.beam_coordinator = beam_coordinator
         self.hisparse_coordinator = hisparse_coordinator
+        # (req, release=) -> True when HiSparse will run `release` itself.
+        self._defer_hisparse_release = defer_hisparse_release
         self.uocr_runtime = uocr_runtime
         self.send_abort_output = send_abort_output
         self.stream_output = stream_output
@@ -102,6 +106,17 @@ class RequestRetirer:
         discard_kv_cache_backup(req, self.tree_cache)
         # HiSparse clears its mapping of the row before the row is freed.
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
+            # Paged residency releases the row itself, once the launched forward
+            # has run.
+            if self._defer_hisparse_release is not None:
+                deferred = self._defer_hisparse_release(
+                    req,
+                    release=partial(
+                        release_kv_cache, req, self.tree_cache, checkpoint=checkpoint
+                    ),
+                )
+                if deferred is True:  # a bool; tests pass Mock coordinators
+                    return
             self.hisparse_coordinator.release_request(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)

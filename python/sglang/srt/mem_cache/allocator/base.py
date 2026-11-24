@@ -258,6 +258,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             tree_cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             _evict_until_allocatable(tree_cache, self, num_tokens)
 
+    def release_ended_requests(self) -> None:
+        """Give back what requests that have ended still hold; called before
+        the pools are cleared. Paged HiSparse keeps an ended request's pages
+        until its last forward has run."""
+
     def check_decode_capacity(
         self,
         *,

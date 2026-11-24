@@ -49,6 +49,124 @@ class TestHiSparseDecodeRemap(CustomTestCase):
         # It took its host rows with its request slot.
         self.assertEqual(reserve(1000, has_req_pool_slot=True), 0)
 
+    def test_buffer_extra_is_the_buffer_charge_of_the_slot_reserve_taken_at_once(self):
+        """The slots a short prompt's buffer adds to its prefill pages: room is
+        made by eviction if the free list is short; a prompt whose pages cover
+        the buffer takes none."""
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.page_size = 64
+        allocator.device = "cpu"
+        allocator._hs_el = None
+        allocator.configure_spec_scratch(1024, device_buffer_size=12352)
+        free = [640]
+        reclaimed = []
+
+        def alloc(need):
+            if need > free[0]:
+                return None
+            free[0] -= need
+            return torch.arange(64, 64 + need)
+
+        def reclaim_device(need):
+            reclaimed.append(need)
+            free[0] = max(free[0], need)
+
+        allocator.hisparse_attn_allocator = SimpleNamespace(
+            available_size=lambda: free[0], alloc=alloc
+        )
+        allocator._reclaimer = SimpleNamespace(reclaim_device=reclaim_device)
+
+        self.assertEqual(allocator.alloc_buffer_extra(20000).numel(), 0)
+        self.assertEqual((free[0], reclaimed), (640, []))
+        # 12352 - 2048: what request_slot_reserve charges besides the scratch.
+        self.assertEqual(
+            allocator.request_slot_reserve(has_req_pool_slot=True, prefill_tokens=2000),
+            10304,
+        )
+        self.assertEqual(allocator.alloc_buffer_extra(2000).numel(), 10304)
+        self.assertEqual((free[0], reclaimed), (0, [10304]))
+        # Nothing can be evicted for it: the caller is told, nothing is taken.
+        allocator._reclaimer = SimpleNamespace(reclaim_device=lambda need: None)
+        free[0] = 128
+        self.assertIsNone(allocator.alloc_buffer_extra(2000))
+        self.assertEqual(free[0], 128)
+
+    def test_pd_transfer_keeps_its_buffer_slots_until_the_buffer_is_built(self):
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = object.__new__(HiSparseCoordinator)
+        slots = torch.arange(64, 128)
+        freed = []
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            alloc_buffer_extra=MagicMock(
+                side_effect=[slots, torch.empty(0, dtype=torch.int64), None]
+            ),
+            free_buffer_extra=freed.append,
+        )
+        short, resident, refused = (
+            SimpleNamespace(kv=SimpleNamespace(req_pool_idx=idx)) for idx in (3, 4, 5)
+        )
+
+        self.assertTrue(coordinator.hold_buffer_slots(short, 2000))
+        self.assertTrue(coordinator.hold_buffer_slots(resident, 20000))
+        self.assertFalse(coordinator.hold_buffer_slots(refused, 2000))
+        self.assertEqual(list(coordinator._recv_buffer_hold), [3])
+
+        coordinator._give_back_buffer_hold(4)
+        coordinator._give_back_buffer_hold(5)
+        self.assertEqual(freed, [])
+        coordinator._give_back_buffer_hold(3)
+        coordinator._give_back_buffer_hold(3)
+        self.assertEqual(len(freed), 1)
+        self.assertIs(freed[0], slots)
+        # A coordinator that never kept slots (also one built without __init__).
+        object.__new__(HiSparseCoordinator)._give_back_buffer_hold(0)
+
+    def test_a_prealloc_without_frames_gives_back_what_it_took_with_its_row(self):
+        """The reclaim behind the room check can come back short. The request then
+        holds its scratch, a short prompt's host rows and its row with nothing in
+        it: a later release would free the row's previous occupant."""
+        from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+
+        coordinator = object.__new__(HiSparseCoordinator)
+        freed = []
+        coordinator._recv_buffer_hold = {3: torch.arange(128, 192)}
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            free_buffer_extra=lambda slots: freed.append(("buffer", slots.tolist()[:1]))
+        )
+        coordinator.spec_swap = SimpleNamespace(
+            free_unrotated_scratch=lambda rid: freed.append(("scratch", rid))
+        )
+        coordinator.req_to_host_pool = torch.full((4, 8), -1, dtype=torch.int64)
+        coordinator.req_to_host_pool[3, :4] = torch.arange(40, 44)
+        coordinator.req_to_host_pool_allocated_len = torch.tensor([0, 0, 0, 4])
+        coordinator.mem_pool_host = SimpleNamespace(
+            allocated_host_indices=lambda table, rid, n: table[rid, : int(n)],
+            free=lambda slots: freed.append(("host", slots.tolist())),
+        )
+        req = SimpleNamespace(kv=ReqKvInfo())
+        req.kv.req_pool_idx = 3
+
+        coordinator.cancel_prealloc(req)
+
+        self.assertEqual(
+            freed, [("buffer", [128]), ("scratch", 3), ("host", [40, 41, 42, 43])]
+        )
+        self.assertEqual(coordinator._recv_buffer_hold, {})
+        self.assertTrue(bool((coordinator.req_to_host_pool[3] == -1).all()))
+        self.assertEqual(int(coordinator.req_to_host_pool_allocated_len[3]), 0)
+
+    def test_device_pages_are_freed_in_ascending_order(self):
+        # An eviction hands its frames over in the order it picked them; the
+        # free list gets them as free_hisparse_indices would return them.
+        freed = []
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.hisparse_attn_allocator = SimpleNamespace(
+            free_page_ids=lambda pages: freed.append(pages.tolist())
+        )
+        allocator.free_device_pages(torch.tensor([9, 3, 7, 4]))
+        self.assertEqual(freed, [[3, 4, 7, 9]])
+
     def test_paged_pool_budget_marks_a_refusal_no_wait_can_lift(self):
         """With paged residency a request refused while no request holds logical
         slots is unschedulable; without it the allocator keeps the plain budget."""
@@ -71,8 +189,11 @@ class TestHiSparseDecodeRemap(CustomTestCase):
         )
         self.assertIs(type(allocator.create_prefill_budget(tree_cache)), PrefillBudget)
 
+        spare_scratch = [0]
         allocator._reclaimer = SimpleNamespace(
-            hs_exclusive=False, reclaimable_slots=lambda: 0
+            hs_exclusive=False,
+            reclaimable_slots=lambda: 0,
+            spare_scratch_slots=lambda: spare_scratch[0],
         )
         budget = allocator.create_prefill_budget(tree_cache)
         self.assertIsInstance(budget, HiSparsePagedPrefillBudget)
@@ -93,6 +214,12 @@ class TestHiSparseDecodeRemap(CustomTestCase):
         # A request holds slots: the refused one waits for it.
         logical_free[0] = 6336
         self.assertFalse(fits(1344))
+        self.assertFalse(budget.unschedulable)
+        # Scratch blocks kept for the next arrivals are free memory: an idle pool
+        # that holds some still takes the request.
+        logical_free[0] = 6400
+        spare_scratch[0] = 64
+        self.assertTrue(fits(1344))
         self.assertFalse(budget.unschedulable)
         # A request admitted earlier in the same pass will hold memory.
         logical_free[0] = 6400
@@ -501,6 +628,46 @@ class TestHiSparseRetraction(CustomTestCase):
 
         allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
         self.assertTrue(retraction_needs_rebootstrap(allocator))
+
+    def _allocator(self, free, reclaimer):
+        allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
+        allocator.available_size = lambda: free[0]
+        allocator.evict_to_free_tokens = lambda tree_cache, num_tokens: None
+        allocator._reclaimer = reclaimer
+        return allocator
+
+    def test_a_decode_shortfall_takes_the_ended_requests_pages_first(self):
+        """An ended request keeps its pages until its last forward has run; the
+        step that would retract for want of them waits for that instead."""
+        free = [0]
+        drains = []
+
+        def run_deferred_releases(block=False):
+            drains.append(block)
+            free[0] = 128
+
+        allocator = self._allocator(
+            free, SimpleNamespace(run_deferred_releases=run_deferred_releases)
+        )
+        self.assertTrue(allocator.check_decode_capacity(num_tokens=64, tree_cache=None))
+        self.assertEqual(drains, [True])
+
+    def test_a_step_that_fits_does_not_wait_for_the_ended_requests(self):
+        drains = []
+        allocator = self._allocator(
+            [64],
+            SimpleNamespace(run_deferred_releases=lambda block=False: drains.append(1)),
+        )
+        self.assertTrue(allocator.check_decode_capacity(num_tokens=64, tree_cache=None))
+        self.assertEqual(drains, [])
+
+    def test_a_shortfall_that_remains_is_reported(self):
+        allocator = self._allocator(
+            [0], SimpleNamespace(run_deferred_releases=lambda block=False: None)
+        )
+        self.assertFalse(
+            allocator.check_decode_capacity(num_tokens=64, tree_cache=None)
+        )
 
 
 if __name__ == "__main__":

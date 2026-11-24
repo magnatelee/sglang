@@ -183,5 +183,41 @@ class TestTakeOutWithoutRelease(CustomTestCase):
         self.assertEqual(req.exit_via, "release")
 
 
+class TestHiSparseRelease(CustomTestCase):
+    def _release(self, calls, defer):
+        retirer = request_retirer.RequestRetirer(
+            tree_cache=MagicMock(),
+            beam_coordinator=SimpleNamespace(retire_group=lambda req: None),
+            hisparse_coordinator=SimpleNamespace(
+                release_request=lambda req: calls.append("hisparse")
+            ),
+            uocr_runtime=None,
+            send_abort_output=None,
+            stream_output=None,
+            defer_hisparse_release=defer,
+        )
+        with patch.object(
+            request_retirer,
+            "release_kv_cache",
+            side_effect=lambda req, cache, *, checkpoint: calls.append("row"),
+        ):
+            retirer.release(_req(FINISH_LENGTH(length=0), calls), checkpoint=False)
+
+    def test_a_deferred_release_frees_the_row_when_hisparse_runs_it(self):
+        # Paged residency: the launched forward may still use the request's
+        # pages, so nothing is freed in this call.
+        calls = []
+        deferred = []
+        self._release(calls, lambda req, release: deferred.append(release) or True)
+        self.assertEqual(calls, [])
+        deferred[0]()
+        self.assertEqual(calls, ["row"])
+
+    def test_a_release_that_is_not_deferred_clears_hisparse_before_the_row(self):
+        calls = []
+        self._release(calls, lambda req, release: False)
+        self.assertEqual(calls, ["hisparse", "row"])
+
+
 if __name__ == "__main__":
     unittest.main()
