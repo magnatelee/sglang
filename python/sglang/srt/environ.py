@@ -855,6 +855,14 @@ class Envs:
     # arrival like every longer one (it keeps its prefill pages and gets no hot buffer), so no request is
     # buffered and every decode replay is the all-resident graph. Off: such a prompt lives in a hot buffer.
     SGLANG_HISPARSE_PAGED_SHORT_RESIDENT = EnvBool(False)
+    # Decode-step changes, each off by default (off = the paths as they were):
+    # WLOC_ONCE: a forward's write locations are translated to device slots by the first layer that
+    # writes and reused by the others (one kernel per forward instead of one per layer).
+    SGLANG_HISPARSE_PAGED_WLOC_ONCE = EnvBool(False)
+    # ROWCACHE_FUSED: the row cache's plan in fewer kernels (the redirect marks the cache hits; the
+    # install list is compacted by one kernel that scans the block counts itself). Same tables, same
+    # cache contents, same install lists.
+    SGLANG_HISPARSE_PAGED_ROWCACHE_FUSED = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)

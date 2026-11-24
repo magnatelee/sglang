@@ -274,6 +274,11 @@ class HiSparsePagingManager:
         # ---- host-row cache of the all-resident graph ----
         self._rc_rows = 0
         self._rc_memo = None
+        # SGLANG_HISPARSE_PAGED_ROWCACHE_FUSED: the plan in fewer kernels; _rc_premarked = the redirected
+        # table whose hits the redirect kernel already marked (under the plan's stamp)
+        self._rc_fused = bool(envs.SGLANG_HISPARSE_PAGED_ROWCACHE_FUSED.get())
+        self._rc_premarked = None
+        self.rc_plans = [0, 0]  # plans whose hits the redirect's kernel marked, plans that marked themselves
         rc = max(0, int(envs.SGLANG_HISPARSE_PAGED_ROWCACHE_ROWS.get()))
         if rc and coordinator.enable_prefetch:
             if rc & (rc - 1) or rc < 1024:
@@ -342,6 +347,14 @@ class HiSparsePagingManager:
             # load the kernels now (HBM has room): a plan over one slot that is not a host row, an empty install
             z1 = torch.full((1,), -1, dtype=torch.int32, device=device)
             self._rc_plan(z1, 0)
+            if self._rc_fused:  # the fused redirect too
+                z2 = torch.empty_like(z1)
+                self._rc_stamp.add_(1)
+                self._redirect_mark_raw(z1, 0, z2)
+                self._rc_premarked = z2
+                self._rc_plan(z2, 0)
+                self._rc_stamp.fill_(1)  # as after the one plan above: the stamps stay those of the unfused plan
+                self.rc_plans = [0, 0]
             self._rc_copy(0, 0)
             self._rc_copy(0, 0, inline=True)
             self.rc_stat.zero_()
@@ -1201,22 +1214,25 @@ class HiSparsePagingManager:
         C, P = self._rc_rows, coordinator.page_size
         tag, tep, ep = self.rc_tag[g], self.rc_tep[g], self.rc_epoch
         h0, h1 = self.host_row0, self._rc_host_end
-        self._rc_stamp.add_(1)
         st = self._rc_stamp
-        K.row_cache_mark[(nb,)](
-            flat,
-            n,
-            tag,
-            tep,
-            ep,
-            self.rc_used,
-            st,
-            h0,
-            h1,
-            LOGC=self._rc_logc,
-            PAGE=P,
-            BLOCK=B,
-        )
+        premarked, self._rc_premarked = self._rc_premarked is slots, None
+        self.rc_plans[0 if premarked else 1] += 1
+        if not premarked:  # else: the fused redirect advanced the stamp and marked this table's hits
+            self._rc_stamp.add_(1)
+            K.row_cache_mark[(nb,)](
+                flat,
+                n,
+                tag,
+                tep,
+                ep,
+                self.rc_used,
+                st,
+                h0,
+                h1,
+                LOGC=self._rc_logc,
+                PAGE=P,
+                BLOCK=B,
+            )
         K.row_cache_claim[(nb,)](
             flat,
             n,
@@ -1236,27 +1252,47 @@ class HiSparsePagingManager:
         cb = C // B
         cnt = torch.empty(cb, dtype=torch.int32, device=flat.device)
         K.row_cache_count[(cb,)](self.rc_cst, st, cnt, BLOCK=B)
-        c64 = cnt.to(torch.int64)
-        off = (torch.cumsum(c64, 0) - c64).contiguous()
-        self.rc_total[g].copy_(
-            c64.sum().clamp(max=self._rc_cap).to(torch.int32).reshape(1)
-        )
-        K.row_cache_compact[(cb,)](
-            self.rc_cst,
-            self.rc_cval,
-            st,
-            off,
-            self.rc_scr,
-            ep,
-            tag,
-            tep,
-            self.rc_src[g],
-            self.rc_dst[g],
-            h0,
-            self._rc_cap,
-            PAGE=P,
-            BLOCK=B,
-        )
+        if self._rc_fused:  # block offsets and the list's length inside the compacting kernel
+            K.row_cache_compact_scan[(cb,)](
+                self.rc_cst,
+                self.rc_cval,
+                st,
+                cnt,
+                self.rc_total[g],
+                self.rc_scr,
+                ep,
+                tag,
+                tep,
+                self.rc_src[g],
+                self.rc_dst[g],
+                h0,
+                self._rc_cap,
+                PAGE=P,
+                BLOCK=B,
+                NBLK=cb,
+            )
+        else:
+            c64 = cnt.to(torch.int64)
+            off = (torch.cumsum(c64, 0) - c64).contiguous()
+            self.rc_total[g].copy_(
+                c64.sum().clamp(max=self._rc_cap).to(torch.int32).reshape(1)
+            )
+            K.row_cache_compact[(cb,)](
+                self.rc_cst,
+                self.rc_cval,
+                st,
+                off,
+                self.rc_scr,
+                ep,
+                tag,
+                tep,
+                self.rc_src[g],
+                self.rc_dst[g],
+                h0,
+                self._rc_cap,
+                PAGE=P,
+                BLOCK=B,
+            )
         out_a = torch.empty_like(flat)
         out_r = torch.empty_like(flat)
         K.row_cache_resolve[(nb,)](
@@ -1367,6 +1403,42 @@ class HiSparsePagingManager:
             BLOCK=block,
         )
 
+    def _redirect_mark_raw(self, src: torch.Tensor, g: int, out: torch.Tensor) -> None:
+        """_redirect_raw and the row cache's mark pass over its output in one kernel. The caller has
+        advanced the plan's stamp; `out` goes to `_rc_plan`, which then skips the mark."""
+        coordinator = self._coordinator
+        n = src.numel()
+        if n == 0:
+            return
+        assert (
+            src.dtype == torch.int32
+            and out.dtype == torch.int32
+            and src.is_contiguous()
+            and out.is_contiguous()
+        )
+        block = 1024
+        D, H = self.num_device_pages, self._host_pages
+        paging_kernels.redirect_slots_mark[((n + block - 1) // block,)](
+            src,
+            out,
+            n,
+            self.gredir[g],
+            self.gcnt[g],
+            self.host_row0 // coordinator.page_size,
+            D,
+            D + H,
+            self.rc_tag[g],
+            self.rc_tep[g],
+            self.rc_epoch,
+            self.rc_used,
+            self._rc_stamp,
+            self.host_row0,
+            self._rc_host_end,
+            LOGC=self._rc_logc,
+            PAGE=coordinator.page_size,
+            BLOCK=block,
+        )
+
     def redirect(self, locs: torch.Tensor, layer_id: int) -> torch.Tensor:
         """The slots this layer's attention reads: `locs` through its group's redirects. An anchor computes (and
         counts); its skip layers, handed the same slot table, reuse the anchor's result."""
@@ -1387,7 +1459,21 @@ class HiSparsePagingManager:
             return memo[1]
         src = locs if locs.is_contiguous() else locs.contiguous()
         out = torch.empty_like(src)
-        self._redirect_raw(src, g, out)
+        if (
+            self._rc_fused
+            and self._rc_rows
+            and src.ndim in (2, 3)
+            and src.numel() > 0
+            and not coordinator._is_shared_index_layer[layer_id]
+            and get_capture_attention_variant() == HISPARSE_RESIDENT
+        ):
+            # the plan that read_through_row_cache makes of this table starts here: its stamp, and
+            # the hits marked by the redirect's kernel
+            self._rc_stamp.add_(1)
+            self._redirect_mark_raw(src, g, out)
+            self._rc_premarked = out
+        else:
+            self._redirect_raw(src, g, out)
         self._gmemo = (key, out)
         return out
 

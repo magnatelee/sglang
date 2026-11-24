@@ -104,6 +104,11 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         # The host pool's tokens over the device pool's: the logical ratio unless
         # exclusive placement names a smaller host pool.
         self._hs_host_ratio = host_to_device_ratio
+        # SGLANG_HISPARSE_PAGED_WLOC_ONCE: [the forward's loc tensor, its version, the map, its
+        # version, capture state, last layer id, the translated slots]; [translations, reuses].
+        self._hs_wloc_once = bool(envs.SGLANG_HISPARSE_PAGED_WLOC_ONCE.get())
+        self._hs_wloc_memo = None
+        self._hs_wloc_stats = [0, 0]
         if envs.SGLANG_HISPARSE_PAGED.get():
             index_buf_size = int(size * host_to_device_ratio) // page_size * page_size
             host_tokens = (
@@ -294,6 +299,37 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
             )
         return super().translate_loc_to_hisparse_device(compressed_indices)
 
+    def hs_write_slots(self, loc: torch.Tensor, layer_id: int) -> torch.Tensor:
+        """The device slots a layer writes a forward's new rows to.
+
+        Off (default): translated at every layer. SGLANG_HISPARSE_PAGED_WLOC_ONCE: translated by the
+        first layer that writes in a forward and reused by the layers after it. A forward is the same
+        `loc` tensor object (a forward's `out_cache_loc`), unchanged in place, with the map unchanged in
+        place, the same capture state, and layer ids that only grow; anything else translates again.
+        The map's entries for a forward's write locations are set before its launch and do not change
+        while it runs, so the reused table is the one every layer would compute."""
+        if not (getattr(self, "_hs_wloc_once", False) and loc.is_cuda and loc.ndim == 1):
+            return self.translate_loc_to_hisparse_device(loc)
+        mapping = self.full_to_hisparse_device_index_mapping
+        capturing = torch.cuda.is_current_stream_capturing()
+        memo = self._hs_wloc_memo
+        if (
+            memo is not None
+            and memo[0] is loc
+            and memo[1] == loc._version
+            and memo[2] is mapping
+            and memo[3] == mapping._version
+            and memo[4] == capturing
+            and layer_id > memo[5]
+        ):
+            memo[5] = layer_id
+            self._hs_wloc_stats[1] += 1
+            return memo[6]
+        out = self.translate_loc_to_hisparse_device(loc)
+        self._hs_wloc_memo = [loc, loc._version, mapping, mapping._version, capturing, layer_id, out]
+        self._hs_wloc_stats[0] += 1
+        return out
+
     def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
         return full_indices
 
@@ -317,7 +353,9 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
-        loc = self.translate_loc_to_hisparse_device(loc)
+        loc = self.hs_write_slots(
+            loc, layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         super().set_mla_kv_buffer(
             layer,
             loc,
