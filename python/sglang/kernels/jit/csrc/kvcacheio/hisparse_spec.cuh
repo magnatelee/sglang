@@ -833,8 +833,10 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
           const int32_t victim_count = direct_overflow ? miss_count - scratch_capacity : miss_count;
           const int32_t victim_ordinal = direct_overflow ? unique_idx - scratch_capacity : unique_idx;
           for (int32_t linear = victim_ordinal; linear < HOT_BUFFER_SIZE; linear += victim_count) {
+            // 64-bit: a 32-bit product wraps, and its remainder is a permutation of the
+            // slots only when HOT_BUFFER_SIZE is a power of two (same values there).
             const int32_t candidate = static_cast<int32_t>(
-                (static_cast<uint32_t>(linear) * 2654435761u + static_cast<uint32_t>(cache_epoch)) % HOT_BUFFER_SIZE);
+                (static_cast<uint64_t>(linear) * 2654435761ull + static_cast<uint32_t>(cache_epoch)) % HOT_BUFFER_SIZE);
             const int32_t observed = req_cache_ref_bits[candidate];
             if (observed == cache_epoch) {
               continue;
@@ -858,11 +860,12 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     __syncthreads();
 
     if ((direct_overflow || rotate_compact) && victim < 0) {
-      const uint32_t start =
-          (static_cast<uint32_t>(clock_cursor) + static_cast<uint32_t>(compact_idx) * 2654435761u) % HOT_BUFFER_SIZE;
+      const uint64_t start =
+          (static_cast<uint64_t>(clock_cursor) + static_cast<uint64_t>(compact_idx) * 2654435761ull) % HOT_BUFFER_SIZE;
       for (int32_t attempt = 0; attempt < HOT_BUFFER_SIZE; ++attempt) {
+        // Visits every slot once for any HOT_BUFFER_SIZE (the multiplier is prime).
         const int32_t candidate =
-            static_cast<int32_t>((start + static_cast<uint32_t>(attempt) * 2654435761u) % HOT_BUFFER_SIZE);
+            static_cast<int32_t>((start + static_cast<uint64_t>(attempt) * 2654435761ull) % HOT_BUFFER_SIZE);
         const int32_t observed = req_cache_ref_bits[candidate];
         if (observed == cache_epoch) {
           continue;
@@ -925,6 +928,9 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
       }
       copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
     }
+    // The next iteration's direct choices are plain writes: they must not overlap a
+    // slower warp's fallback probe of this iteration, or both take the same slot.
+    __syncthreads();
   }
 
   __syncthreads();
