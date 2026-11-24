@@ -726,6 +726,7 @@ class HiSparseCoordinator:
     _hs_verify_sel = None  # (class default)
     enable_resident = False
     hs_exclusive = False
+    hs_short_resident = False  # (class default) no request is kept in a hot buffer
     hs_host_scarce = False
     paging = None
     _resident = types.MappingProxyType({})
@@ -969,6 +970,21 @@ class HiSparseCoordinator:
             raise ValueError(
                 "SGLANG_HISPARSE_PAGED_EXCLUSIVE needs SGLANG_HISPARSE_PAGED."
             )
+        # Short prompts resident: a prompt no longer than the hot buffer keeps its
+        # prefill pages like every longer one, so no request is buffered.
+        self.hs_short_resident = bool(envs.SGLANG_HISPARSE_PAGED_SHORT_RESIDENT.get())
+        if self.hs_short_resident and not self.hs_exclusive:
+            raise ValueError(
+                "SGLANG_HISPARSE_PAGED_SHORT_RESIDENT needs SGLANG_HISPARSE_PAGED "
+                "and SGLANG_HISPARSE_PAGED_EXCLUSIVE."
+            )
+        if self.hs_short_resident and isinstance(
+            self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+        ):
+            # No prompt is charged a hot buffer, and none holds one from pre-allocation.
+            self.token_to_kv_pool_allocator.configure_spec_scratch(
+                self.spec_swap.scratch_capacity, device_buffer_size=0
+            )
         # Under speculative decoding a resident request's verify tokens are
         # written to its own mirrored device pages.
         self.hs_spec_res = self.enable_resident and num_draft_tokens > 0
@@ -1091,7 +1107,7 @@ class HiSparseCoordinator:
                 self.hs_host_scarce = (
                     self.mem_pool_host.size < self.token_to_kv_pool_allocator.size_full
                 )
-                if self.hs_host_scarce:
+                if self.hs_host_scarce and not self.hs_short_resident:
                     self.token_to_kv_pool_allocator._buffered_prompt_tokens = (
                         self.device_buffer_size
                     )
@@ -1102,6 +1118,12 @@ class HiSparseCoordinator:
                     self.mem_pool_host.size,
                     self.mem_pool_device.size,
                 )
+                if self.hs_short_resident:
+                    logger.info(
+                        "HiSparse paged: short prompts resident (a prompt of up to "
+                        "%d tokens keeps its prefill pages; no request is buffered)",
+                        self.device_buffer_size,
+                    )
             # From here on admission counts pages that can move to host as free.
             self.token_to_kv_pool_allocator.set_reclaimer(self)
 
@@ -1441,7 +1463,8 @@ class HiSparseCoordinator:
     ) -> torch.Tensor:
         """Grow device buffers for requests whose sequence length exceeds current capacity."""
         current_caps = self.req_device_buffer_size[req_pool_indices_cpu]
-        short_reqs_cpu = seq_lens_cpu <= self.device_buffer_size
+        # A request that lives in its buffer; with short prompts resident, none.
+        short_reqs_cpu = seq_lens_cpu <= self._buffered_prompt_limit()
         needs_grow_cpu = short_reqs_cpu & (seq_lens_cpu > current_caps)
 
         if torch.any(needs_grow_cpu):
@@ -1600,11 +1623,18 @@ class HiSparseCoordinator:
             self.device, non_blocking=True
         )
 
+    def _buffered_prompt_limit(self) -> int:
+        """The longest prompt that lives in a hot buffer instead of its prefill
+        pages: the buffer's size, or none with short prompts resident."""
+        return 0 if self.hs_short_resident else self.device_buffer_size
+
     def _can_stay_resident(self, req: Req) -> bool:
-        # Short requests already live wholly in their buffer (the kernel's short fast path).
+        # Short requests already live wholly in their buffer (the kernel's short
+        # fast path), unless short prompts are resident too.
         return (
             self.enable_resident
-            and self.host_token_len(req.kv.kv_allocated_len) > self.device_buffer_size
+            and self.host_token_len(req.kv.kv_allocated_len)
+            > self._buffered_prompt_limit()
         )
 
     def _make_resident(self, req: Req) -> None:
@@ -1690,7 +1720,7 @@ class HiSparseCoordinator:
             rid = req.kv.req_pool_idx
             total = len(req.full_untruncated_fill_ids)
             held = int(self.req_to_host_pool_allocated_len[rid])
-            if total > self.device_buffer_size or held >= total:
+            if total > self._buffered_prompt_limit() or held >= total:
                 continue
             self.paging.ensure_host(-(-total // P) * P - held, must=True)
             self.mem_pool_host.alloc_paged_token_slots(

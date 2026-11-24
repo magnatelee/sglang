@@ -851,6 +851,10 @@ class Envs:
     SGLANG_HISPARSE_PAGED_EXCLUSIVE = EnvBool(False)
     # Host pool tokens per rank under SGLANG_HISPARSE_PAGED_EXCLUSIVE; 0 = the logical pool.
     SGLANG_HISPARSE_PAGED_HOST_TOKENS = EnvInt(0)
+    # Under SGLANG_HISPARSE_PAGED_EXCLUSIVE: a prompt no longer than the hot buffer is resident from its
+    # arrival like every longer one (it keeps its prefill pages and gets no hot buffer), so no request is
+    # buffered and every decode replay is the all-resident graph. Off: such a prompt lives in a hot buffer.
+    SGLANG_HISPARSE_PAGED_SHORT_RESIDENT = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)

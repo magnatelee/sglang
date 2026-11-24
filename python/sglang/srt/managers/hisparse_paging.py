@@ -1783,6 +1783,9 @@ class HiSparsePagingManager:
                 block=pending is not None and (unlisted is None or pending[5] <= unlisted)
             )
         end = self.registered_len.pop(rid, 0)
+        if self.exclusive:
+            # Also for a request that ends before its first whole page is registered.
+            self.host_len.pop(rid, None)
         if end <= 0:
             return
         P = coordinator.page_size
@@ -1816,7 +1819,6 @@ class HiSparsePagingManager:
         frames = dev_first[on_dev] // P
         num_exclusive = 0
         if self.exclusive:
-            self.host_len.pop(rid, None)
             num_exclusive = int(self.xframe[frames].sum())
             self.xframe[frames] = False
             self.num_exclusive_pages -= num_exclusive
