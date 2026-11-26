@@ -70,6 +70,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.hisparse_shard import HiSparseShardView
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     MiniMaxSparseKVPool,
@@ -750,6 +751,7 @@ class HiSparseCoordinator:
     hs_exclusive = False
     hs_short_resident = False  # (class default) no request is kept in a hot buffer
     hs_resident_only = False  # (class default) nothing of the buffered path is built
+    shard = HiSparseShardView()  # (class default) the context is not split over GPUs
     hs_host_scarce = False
     paging = None
     _resident = types.MappingProxyType({})
@@ -1310,9 +1312,13 @@ class HiSparseCoordinator:
         received: the prompt arrived by a PD transfer."""
         req.hisparse_staging = True
 
-        full_kv_indices = self.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, : req.extend_end
-        ].to(dtype=torch.int64, copy=True)
+        # Paged tables are per shard and in rows (no split: a row is a token).
+        full_kv_indices = self.shard.rows(
+            self.req_to_token_pool.req_to_token,
+            req.kv.req_pool_idx,
+            0,
+            self.shard.extent(req.extend_end),
+        ).to(dtype=torch.int64, copy=True)
         device_indices = (
             self.mem_pool_device.translate_loc_from_full_to_hisparse_device(
                 full_kv_indices
@@ -1366,10 +1372,19 @@ class HiSparseCoordinator:
             held = int(self.req_to_host_pool_allocated_len[req.kv.req_pool_idx])
             self.paging.ensure_host(page_end - held, must=True)
             return prefill_len
-        whole = prefill_len // self.page_size * self.page_size
+        # Split: only rows every shard has written (the prompt's last rows may still come).
+        complete = (
+            self.shard.whole(req.extend_end) if self.shard.split else prefill_len
+        )
+        whole = complete // self.page_size * self.page_size
         # Free slots only: taking slots back from pages in the device pool would
         # copy every arrival to host and wait for the launched forward to do it.
-        if not received and self.mem_pool_host.available_size() >= whole:
+        # Split: free host slots differ between the shards, and the copy must not.
+        if (
+            not received
+            and not self.shard.split
+            and self.mem_pool_host.available_size() >= whole
+        ):
             return whole
         self.paging.xstats[5] += 1
         return 0
@@ -2082,7 +2097,8 @@ class HiSparseCoordinator:
             for i in rows:
                 req = batch.reqs[i]
                 rid = req.kv.req_pool_idx
-                L, E = self._hs_dev_len[rid], int(req.kv.kv_allocated_len)
+                L = self._hs_dev_len[rid]
+                E = self.shard.extent(int(req.kv.kv_allocated_len))
                 if E > L:
                     out.append((rid, L, min(E, -(-L // P) * P), E))
             return out
@@ -2106,6 +2122,7 @@ class HiSparseCoordinator:
                     f"HiSparse spec residency: device allocation of {need} slots failed"
                 )
             r2t = self.req_to_token_pool.req_to_token
+            rows_of = self.shard.rows
             mapping = (
                 self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
             )
@@ -2113,11 +2130,11 @@ class HiSparseCoordinator:
             for rid, L, pe, E in todo:
                 if pe > L:  # the rest of the device page that holds position L - 1
                     # a one-element index: a scalar one reads the slot back to the host
-                    base = mapping[r2t[rid, L - 1 : L].to(torch.int64)]
-                    log_parts.append(r2t[rid, L:pe])
+                    base = mapping[rows_of(r2t, rid, L - 1, L).to(torch.int64)]
+                    log_parts.append(rows_of(r2t, rid, L, pe))
                     dev_parts.append(base + 1 + self._hs_arange_page[: pe - L])
                 if E > pe:
-                    log_parts.append(r2t[rid, pe:E])
+                    log_parts.append(rows_of(r2t, rid, pe, E))
                     dev_parts.append(full[off : off + E - pe].to(torch.int64))
                     off += E - pe
                 self._hs_dev_len[rid] = E
@@ -2698,7 +2715,7 @@ class HiSparseCoordinator:
             if self.hs_exclusive:
                 # Host slots sit wherever a page left the device pool, not in a prefix.
                 self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = (
-                    req.kv.kv_allocated_len
+                    self.shard.extent(req.kv.kv_allocated_len)
                 )
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the

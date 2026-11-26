@@ -9,6 +9,7 @@ import torch
 
 from sglang.kernels.ops.kvcache import hisparse_paging as paging_kernels
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hisparse_shard import HiSparseShardView
 from sglang.srt.mem_cache.stream_handoff import handed_over, staged
 from sglang.srt.utils import get_device_module
 
@@ -113,8 +114,12 @@ class HiSparsePagingManager:
     GUARD_SLOTS = 256
     _guard_counts = None  # (class default for managers built without __init__: no guard)
 
+    # (class default for managers built without __init__) the context is not split over GPUs
+    shard = HiSparseShardView()
+
     def __init__(self, coordinator: HiSparseCoordinator):
         self._coordinator = coordinator
+        self.shard = coordinator.shard
         device = coordinator.device
         self._guard_counts = torch.zeros(
             self.GUARD_SLOTS,
@@ -459,12 +464,13 @@ class HiSparsePagingManager:
             self._log()
 
     def sealable_end(self, req: Req) -> int:
-        """Positions [0, end) are whole pages below the page the request is writing."""
+        """Rows [0, end) are whole pages below the page the request is writing."""
         coordinator = self._coordinator
         P = coordinator.page_size
+        shard = self.shard
         if coordinator.hs_spec_res:  # MTP: positions at or above the committed length may still be rewritten by a verify
-            return int(req.kv.kv_committed_len) // P * P
-        return (int(req.kv.kv_allocated_len) - 1) // P * P
+            return shard.whole(int(req.kv.kv_committed_len)) // P * P
+        return shard.whole(int(req.kv.kv_allocated_len) - 1) // P * P
 
     def register(self, rid: int, req: Req) -> None:
         """Make the sealed full pages [registered, end) of resident request `rid` evictable. They are in HBM: a page
@@ -561,18 +567,17 @@ class HiSparsePagingManager:
         mapping = (
             coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
         )
-        first = coordinator.req_to_token_pool.req_to_token[rid, start:end:P].to(
-            torch.int64
-        )
+        req_to_token = coordinator.req_to_token_pool.req_to_token
+        first = self.shard.rows(req_to_token, rid, start, end, P).to(torch.int64)
         dev_first = mapping[first]
         # Positions below host_len were staged; nothing else of an unregistered page has a host slot.
         num_staged = max(0, min(end, self.host_len.get(rid, 0)) - start) // P
         num_pages = (end - start) // P
         host_first = coordinator.req_to_host_pool[rid, start:end:P]
         if self._check:
-            last = coordinator.req_to_token_pool.req_to_token[
-                rid, start + P - 1 : end : P
-            ].to(torch.int64)
+            last = self.shard.rows(
+                req_to_token, rid, start + P - 1, end, P
+            ).to(torch.int64)
             staged = host_first[:num_staged]
             ok = (
                 bool((first % P == 0).all())
@@ -902,8 +907,11 @@ class HiSparsePagingManager:
             return
         end = self.registered_len.get(rid, 0)
         if end > 0:
-            P = self._coordinator.page_size
-            first = self._coordinator.req_to_token_pool.req_to_token[rid, 0:end:P]
+            coordinator = self._coordinator
+            P = coordinator.page_size
+            first = self.shard.rows(
+                coordinator.req_to_token_pool.req_to_token, rid, 0, end, P
+            )
             self.lp_prompt[first.to(torch.int64) // P] = False
         self._seal_unlisted[rid] = self._seal_serial
 
@@ -1879,7 +1887,9 @@ class HiSparsePagingManager:
         mapping = (
             coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
         )
-        first = coordinator.req_to_token_pool.req_to_token[rid, 0:end:P].to(torch.int64)
+        first = self.shard.rows(
+            coordinator.req_to_token_pool.req_to_token, rid, 0, end, P
+        ).to(torch.int64)
         dev_first = mapping[first]
         # Read back on this stream (it never waits for the batch in flight), before the frame tables are
         # indexed with what the map says: a page that is not in its own frame was read from another's rows.
