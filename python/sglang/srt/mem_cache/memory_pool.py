@@ -4289,6 +4289,7 @@ class HybridLinearKVPool(KVCache):
         post_capture_active: bool = False,
         # HiSparse only: forwarded to a HiSparseDSATokenToKVPool full pool.
         host_to_device_ratio: Optional[int] = None,
+        hisparse_shard=None,
         use_fp4_indexer: bool = False,
         use_combined_kv_buffer: bool = False,
     ):
@@ -4351,6 +4352,8 @@ class HybridLinearKVPool(KVCache):
                 if host_to_device_ratio is None
                 else {"host_to_device_ratio": host_to_device_ratio}
             )
+            if hisparse_shard is not None:
+                hisparse_kwargs["shard"] = hisparse_shard
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,

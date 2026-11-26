@@ -15,6 +15,8 @@ from __future__ import annotations
 import msgspec
 import torch
 
+from sglang.srt.environ import envs
+
 
 class HiSparseShardView(msgspec.Struct, frozen=True):
     count: int = 1  # GPUs a context is split over
@@ -71,3 +73,16 @@ class HiSparseShardView(msgspec.Struct, frozen=True):
             return req_to_token[req_pool_idx, start:end:step]
         n = self.count
         return req_to_token[req_pool_idx, start * n : end * n : step * n] // n
+
+
+def current_shard_view() -> HiSparseShardView:
+    """This worker's share of a split context for the paged HiSparse pools: no split
+    unless SGLANG_HISPARSE_PAGED_DCP is on and the worker runs with --dcp-size > 1."""
+    from sglang.srt.runtime_context import get_parallel
+
+    parallel = get_parallel()
+    if envs.SGLANG_HISPARSE_PAGED_DCP.get() and parallel.attn_dcp_size > 1:
+        return HiSparseShardView(
+            count=parallel.attn_dcp_size, rank=parallel.attn_dcp_rank
+        )
+    return HiSparseShardView()

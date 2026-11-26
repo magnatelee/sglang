@@ -11,12 +11,14 @@ from sglang.kernels.ops.kvcache.hisparse import (
 )
 from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
     translate_padded_hisparse_locations,
+    translate_split_hisparse_locations,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.base_hisparse_memory_pool import (
     HiSparseDevicePoolMappingMixin,
 )
+from sglang.srt.mem_cache.hisparse_shard import HiSparseShardView
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -93,7 +95,14 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         kv_scale_ue8m0: bool = False,
         fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
+        shard: HiSparseShardView = HiSparseShardView(),
     ):
+        # Split context: `size` and every table of this pool count this GPU's rows.
+        self.hs_shard = shard
+        if shard.split and not envs.SGLANG_HISPARSE_PAGED.get():
+            raise ValueError(
+                "HiSparse with a split context (--dcp-size > 1) needs SGLANG_HISPARSE_PAGED."
+            )
         # The parent constructors create the buffers: paged residency maps them
         # into address ranges whose sizes follow from the index-key reservation.
         self._hs_el = None
@@ -178,9 +187,11 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         E = el["n_ik"] * el["ik_pages"] * el["ik_page_bytes"]
         band_max = E // (self.layer_num * row) // self.page_size * self.page_size
         self.hs_peer_writable = self._nvlink_transfer_pool()
-        if self.hs_peer_writable:
-            # The transport imports one allocation per registered range, once:
-            # no rows that are mapped and unmapped at run time.
+        # The transport imports one allocation per registered range, once: no rows that
+        # are mapped and unmapped at run time. Split context: no band either (its size
+        # would have to change on every GPU of a group in the same step).
+        static_ranges = self.hs_peer_writable or self.hs_shard.split
+        if static_ranges:
             band_max = 0
         rows_max = self.size + band_max + self.page_size
         # The host pool's rows follow in the same range: MLATokenToKVPoolHost.size
@@ -208,7 +219,7 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
             k_max=self.size + band_max,
             kv=fam,
             # Ranges mapped once at start: no band, every index key backed.
-            pinned=self.hs_peer_writable,
+            pinned=static_ranges,
         )
         self.kv_buffer = [
             fam.view(l, rows_max * row)
@@ -242,7 +253,7 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
             pages * page_bytes,
             pages * page_bytes if el["pinned"] else 0,
             "ik",
-            peer_writable=el["pinned"],
+            peer_writable=self.hs_peer_writable,
         )
         # Graph capture writes dummy keys into the first pages.
         fam.grow_to((el["headroom"] + 2) * page_bytes)
@@ -293,11 +304,26 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         CUDA and ROCm use a fused kernel for 1D GPU slot lists, preserving
         negative padding. Page tables and CPU inputs keep the direct gather.
         """
+        if self.hs_shard.split:
+            return self._translate_split_locs(compressed_indices)
         if compressed_indices.is_cuda and compressed_indices.ndim == 1:
             return translate_padded_hisparse_locations(
                 self.full_to_hisparse_device_index_mapping, compressed_indices
             )
         return super().translate_loc_to_hisparse_device(compressed_indices)
+
+    def _translate_split_locs(self, slots: torch.Tensor) -> torch.Tensor:
+        """Split context: widened logical slots -> widened slots of this shard's rows
+        (same shard, the row mapped), so the owner rule of every reader and writer of
+        the pool applies to them as it does without HiSparse."""
+        mapping = self.full_to_hisparse_device_index_mapping
+        count = self.hs_shard.count
+        if slots.is_cuda and slots.ndim == 1:
+            return translate_split_hisparse_locations(
+                mapping, slots, shard_count=count
+            )
+        # Page tables and CPU inputs. -1 stays -1: the map's last entry is -1.
+        return mapping[slots // count] * count + slots % count
 
     def hs_write_slots(self, loc: torch.Tensor, layer_id: int) -> torch.Tensor:
         """The device slots a layer writes a forward's new rows to.

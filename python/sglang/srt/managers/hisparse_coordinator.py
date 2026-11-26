@@ -70,6 +70,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     HiSparseTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.hisparse_ledger import HiSparsePageLedger
 from sglang.srt.mem_cache.hisparse_shard import HiSparseShardView
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
@@ -752,6 +753,7 @@ class HiSparseCoordinator:
     hs_short_resident = False  # (class default) no request is kept in a hot buffer
     hs_resident_only = False  # (class default) nothing of the buffered path is built
     shard = HiSparseShardView()  # (class default) the context is not split over GPUs
+    ledger = None  # (class default) split context: the admission numbers every GPU agrees on
     hs_host_scarce = False
     paging = None
     _resident = types.MappingProxyType({})
@@ -951,6 +953,15 @@ class HiSparseCoordinator:
         )
         # Resident-only: no request is ever buffered, so the speculative swap keeps no state.
         self.hs_resident_only = bool(envs.SGLANG_HISPARSE_PAGED_RESIDENT_ONLY.get())
+        # A context split over several GPUs: this GPU's share (the allocator was built for it).
+        self.shard = HiSparseShardView()
+        if isinstance(self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
+            self.shard = self.token_to_kv_pool_allocator.shard
+        if self.shard.split and not self.hs_resident_only:
+            raise ValueError(
+                "HiSparse with a split context (--dcp-size > 1) needs "
+                "SGLANG_HISPARSE_PAGED_RESIDENT_ONLY: main's buffered path has no split form."
+            )
         self.spec_swap = HiSparseSpecSwapManager(
             self,
             num_draft_tokens=num_draft_tokens,
@@ -1134,11 +1145,17 @@ class HiSparseCoordinator:
         if self.enable_resident:
             # Built last: it reads the shared-index groups and the band's limits.
             self.paging = HiSparsePagingManager(self)
+            if self.shard.split:
+                # The schedulers of a group decide alike only on numbers they all hold.
+                self.ledger = HiSparsePageLedger(self)
+                self.token_to_kv_pool_allocator.set_ledger(self.ledger)
+                self._audit_every = envs.SGLANG_HISPARSE_PAGED_LOCKSTEP_AUDIT.get()
+                self._audit_steps = 0
             if self.hs_exclusive:
                 # Not every token has a host slot: a prompt that stays buffered
                 # is charged its host rows at admission and takes them then.
                 self.hs_host_scarce = (
-                    self.mem_pool_host.size < self.token_to_kv_pool_allocator.size_full
+                    self.mem_pool_host.size < self.token_to_kv_pool_allocator.rows_full
                 )
                 if self.hs_host_scarce and not self.hs_short_resident:
                     self.token_to_kv_pool_allocator._buffered_prompt_tokens = (
@@ -1147,7 +1164,7 @@ class HiSparseCoordinator:
                 logger.info(
                     "HiSparse paged: exclusive placement on (logical pool %d tokens, "
                     "host pool %d tokens, device pool %d tokens + band)",
-                    self.token_to_kv_pool_allocator.size_full,
+                    self.token_to_kv_pool_allocator.rows_full,
                     self.mem_pool_host.size,
                     self.mem_pool_device.size,
                 )
@@ -1632,7 +1649,8 @@ class HiSparseCoordinator:
         table = resident_page_table(
             page_table=page_table,
             mapping=self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping,
-            seq_lens=attn_metadata.dsa_seqlens_expanded,
+            # Split context: the table's pages are pages of rows, the same on every shard.
+            seq_lens=self.shard.extent(attn_metadata.dsa_seqlens_expanded),
             page_size=self.page_size,
         )
         self._hs_pt_memo = (key, table)
@@ -1969,7 +1987,7 @@ class HiSparseCoordinator:
         el = self.hs_el
         alloc = self.token_to_kv_pool_allocator
         la = alloc.logical_attn_allocator
-        if la.available_size() // self.page_size >= n_pages + 1:
+        if la.available_size() // alloc.page_size >= n_pages + 1:
             return
         kv, ik, pb, row, P = (
             el["kv"],
@@ -2085,6 +2103,7 @@ class HiSparseCoordinator:
         P = self.page_size
         if self.enable_resident:
             self.paging.step()
+            self._lockstep_tick()
         if self.hs_el is not None:  # lend index-K slack to the band now and then
             self.hs_el_stats[5] += 1
             if self.hs_el_stats[5] % 200 == 0:
@@ -2174,6 +2193,14 @@ class HiSparseCoordinator:
         if not rpi or any(r not in res for r in rpi):
             self._hs_lean[1] += 1
             return False
+        if self.shard.split:
+            self._hs_split_decode(
+                seq_lens, out_cache_loc, req_pool_indices, seq_lens_cpu
+            )
+            self._hs_build_dev_page_table(
+                req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+            )
+            return True
         page = self.mem_pool_device.page_size
         dev = self.token_to_kv_pool_allocator.hisparse_attn_allocator
         need_pages = sum(1 for s in seq_lens_cpu.tolist() if (s - 1) % page == 0)
@@ -2210,6 +2237,75 @@ class HiSparseCoordinator:
                 req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
             )
         return True
+
+    def _lockstep_tick(self) -> None:
+        if self.ledger is None or self._audit_every <= 0:
+            return
+        self._audit_steps += 1
+        if self._audit_steps % self._audit_every == 0:
+            self.lockstep_audit()
+
+    def lockstep_audit(self) -> None:
+        """Split context: the GPUs of the group hold the same ledger, or all of them
+        stop here (a difference would otherwise surface as a hang in a model collective)."""
+        digest = self.ledger.digest()
+        low, high = self._group_min_max(digest)
+        if low != high:
+            raise RuntimeError(
+                "HiSparse paged (split context): the GPUs of a group no longer agree on "
+                f"their admission ledgers (digest {digest}, group min {low}, max {high}; "
+                f"live and movable pages here {self.ledger.counts()})"
+            )
+
+    def _group_min_max(self, value: int) -> tuple[int, int]:
+        pair = torch.tensor([value, -value], dtype=torch.int64, device="cpu")
+        if self.tp_world_size > 1:
+            torch.distributed.all_reduce(
+                pair, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
+            )
+        return int(pair[0]), -int(pair[1])
+
+    def _hs_split_decode(
+        self, seq_lens, out_cache_loc, req_pool_indices, seq_lens_cpu
+    ) -> None:
+        """Split context, every request resident: a decode step opens a row for the
+        requests whose new position is shard 0's, next to their previous row or on a
+        fresh page. The same requests on every GPU; the other new tokens' rows exist."""
+        shard = self.shard
+        page = self.mem_pool_device.page_size
+        lens = seq_lens_cpu.tolist()
+        grow = [i for i, s in enumerate(lens) if (s - 1) % shard.count == 0]
+        self._hs_lean[0] += 1
+        self._resident_steps += 1
+        if not grow:
+            return
+        row_lens_cpu = torch.tensor(
+            [shard.extent(lens[i]) for i in grow], dtype=seq_lens_cpu.dtype
+        )
+        need_pages = sum(1 for n in row_lens_cpu.tolist() if (n - 1) % page == 0)
+        dev = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        if need_pages * page > dev.available_size() and not self.reclaim_device(
+            need_pages * page
+        ):
+            raise RuntimeError(
+                "HiSparse paged (split context): no device frames for a decode step "
+                f"that was admitted ({need_pages} pages)"
+            )
+        idx = self._gpu_rows(grow)
+        grow_lens = seq_lens[idx]
+        mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        # The previous row's anchor is `count` positions before the new token.
+        prev_rows = shard.row_of(
+            self.req_to_token_pool.req_to_token[
+                req_pool_indices[idx], grow_lens - 1 - shard.count
+            ].to(torch.int64)
+        )
+        new_locs = dev.alloc_decode(
+            shard.extent(grow_lens), row_lens_cpu, mapping[prev_rows]
+        )
+        if new_locs is None:
+            raise RuntimeError("HiSparse split decode allocation failed")
+        mapping[shard.row_of(out_cache_loc[idx].to(torch.int64))] = new_locs
 
     def _resident_decode_locs(
         self,
@@ -2313,6 +2409,7 @@ class HiSparseCoordinator:
         )
         if self.enable_resident:
             self.paging.step()
+            self._lockstep_tick()
 
         if not self.is_dsv4_hisparse:
             if self.enable_resident and self._hs_lean_decode(
@@ -2323,6 +2420,11 @@ class HiSparseCoordinator:
                 req_pool_indices_cpu,
             ):
                 return
+            if self.shard.split and len(seq_lens_cpu) > 0:
+                raise RuntimeError(
+                    "HiSparse paged (split context): a decode batch holds a request "
+                    "that is not resident"
+                )
             # Grow device buffers if needed and resolve the latest-token slot.
             reserved_buffer_loc = self._grow_device_buffers(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
@@ -2639,6 +2741,10 @@ class HiSparseCoordinator:
         if not self.enable_resident or self.decode_producer_stream is None:
             return False
         if req.hisparse_staging:  # no forward has read its rows: released at once
+            return False
+        if self.shard.split:
+            # When a deferred release runs depends on this GPU's streams; the request slot
+            # and the logical slots it frees are what every scheduler of the group counts.
             return False
         rid = req.kv.req_pool_idx
         if rid in self._release_pending:  # ended again before its release ran

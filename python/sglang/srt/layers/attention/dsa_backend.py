@@ -1467,6 +1467,17 @@ class DeepseekSparseAttnBackend(
             return metadata.page_table_1.shape[1]
         return self.req_to_token.shape[1]
 
+    def _dcp_placed_kv_rows(self, local_rows: torch.Tensor) -> torch.Tensor:
+        """This rank's logical rows -> the rows of its KV buffers that hold them
+        (paged HiSparse under a split context maps them; otherwise they are the same)."""
+        coordinator = self.hisparse_coordinator
+        if coordinator is None or not coordinator.shard.split:
+            return local_rows
+        mapping = (
+            coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        )
+        return mapping[local_rows.to(torch.int64)]
+
     def dcp_gather_kv_cache(
         self, kv_cache: torch.Tensor, forward_batch: ForwardBatch, metadata: DSAMetadata
     ) -> torch.Tensor:
@@ -1879,12 +1890,14 @@ class DeepseekSparseAttnBackend(
             dsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             dcp_local_kv_rows=(
-                filter_dcp_local_chunk_kv_indices(
-                    page_table_1_flattened,
-                    torch.zeros_like(indexer_seq_lens_cpu),
-                    indexer_seq_lens_cpu,
+                self._dcp_placed_kv_rows(
+                    filter_dcp_local_chunk_kv_indices(
+                        page_table_1_flattened,
+                        torch.zeros_like(indexer_seq_lens_cpu),
+                        indexer_seq_lens_cpu,
+                    )
+                    // self.attn_dcp_size
                 )
-                // self.attn_dcp_size
                 if self.dsa_shards_index_k and page_table_1_flattened is not None
                 else None
             ),
@@ -2749,10 +2762,12 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
-        if (
+        # DCP prefill reads a dense copy of the batch's rows: indices into it are not pool slots.
+        kv_gathered = (
             self.dsa_shards_index_k
             and not forward_batch.forward_mode.is_target_verify()
-        ):
+        )
+        if kv_gathered:
             kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
         if q_rope is not None:
@@ -2834,7 +2849,7 @@ class DeepseekSparseAttnBackend(
                     grouped_topk_indices,
                     layer.layer_id,
                 ).view(num_reqs * num_steps, -1)
-            else:
+            elif not (kv_gathered and self.hisparse_coordinator.shard.split):
                 # flash_mla_sparse_fwd / tilelang require int32 page indices.
                 page_table_1 = self.token_to_kv_pool.translate_loc_to_hisparse_device(
                     page_table_1

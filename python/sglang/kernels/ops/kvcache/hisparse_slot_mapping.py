@@ -57,3 +57,66 @@ def translate_padded_hisparse_locations(
             mapping, locations, output, locations.numel(), locations.stride(0), 128
         )
     return output
+
+
+@triton.jit
+def _translate_split_hisparse_locations(
+    mapping,
+    locations,
+    output,
+    count,
+    stride,
+    SHARDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    loc = tl.load(locations + offset * stride, offset < count, other=-1)
+    row = tl.maximum(loc, 0) // SHARDS
+    physical = tl.load(mapping + row, (offset < count) & (loc >= 0), other=0)
+    placed = physical * SHARDS + tl.maximum(loc, 0) % SHARDS
+    tl.store(output + offset, tl.where(loc >= 0, placed, loc), offset < count)
+
+
+def translate_split_hisparse_locations(
+    mapping: torch.Tensor, locations: torch.Tensor, *, shard_count: int
+) -> torch.Tensor:
+    """Translate widened logical slots into widened physical slots.
+
+    A context split over `shard_count` GPUs addresses its tokens by widened slots:
+    slot s is row s // shard_count of shard s % shard_count. Each shard maps its
+    logical rows to the rows of its own KV buffers:
+
+      output[i] = mapping[locations[i] // shard_count] * shard_count
+                  + locations[i] % shard_count
+
+    so the output names the same shard as the input and that shard's physical row;
+    every consumer that splits a slot into (shard, row) works on it unchanged.
+    Negative locations are padding and are preserved.
+
+    Tensor layout (all tensors are 1D):
+      mapping: contiguous [num_logical_rows]. mapping[logical_row] = physical row.
+      locations: possibly strided [num_tokens], widened logical slots.
+      output: contiguous [num_tokens], the promoted integer dtype of both inputs.
+        The caller keeps physical_row * shard_count within that dtype.
+    """
+    assert shard_count >= 1
+    assert mapping.ndim == locations.ndim == 1 and mapping.is_contiguous()
+    assert mapping.device == locations.device
+    assert mapping.dtype in (torch.int32, torch.int64)
+    assert locations.dtype in (torch.int32, torch.int64)
+    output = torch.empty(
+        locations.shape,
+        device=locations.device,
+        dtype=torch.promote_types(mapping.dtype, locations.dtype),
+    )
+    if locations.numel():
+        _translate_split_hisparse_locations[(triton.cdiv(locations.numel(), 128),)](
+            mapping,
+            locations,
+            output,
+            locations.numel(),
+            locations.stride(0),
+            SHARDS=shard_count,
+            BLOCK=128,
+        )
+    return output

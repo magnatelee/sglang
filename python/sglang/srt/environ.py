@@ -859,6 +859,12 @@ class Envs:
     # graph is captured, a decode step without a graph takes that path too, and the speculative swap
     # keeps no tables and no scratch, so a request is not charged a scratch block.
     SGLANG_HISPARSE_PAGED_RESIDENT_ONLY = EnvBool(False)
+    # Needs SGLANG_HISPARSE_PAGED_RESIDENT_ONLY: paged HiSparse under a split context (--dcp-size > 1).
+    # Every GPU of a group pages its own share of each request; the logical slots stay widened.
+    SGLANG_HISPARSE_PAGED_DCP = EnvBool(False)
+    # Split context: every this many decode or verify steps the GPUs of a group compare a digest of
+    # their admission ledgers; a difference raises on all of them. 0: off.
+    SGLANG_HISPARSE_PAGED_LOCKSTEP_AUDIT = EnvInt(0)
     # Decode-step changes, each off by default (off = the paths as they were):
     # WLOC_ONCE: a forward's write locations are translated to device slots by the first layer that
     # writes and reused by the others (one kernel per forward instead of one per layer).

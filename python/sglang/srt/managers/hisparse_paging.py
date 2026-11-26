@@ -142,9 +142,10 @@ class HiSparsePagingManager:
             coordinator.hs_el["k_max"] + P
         ) // P  # frames of the band too
         self._host_pages = va.host_rows // P
-        if (self.host_row0 + va.host_rows) >= 2**31:
+        # Split context: the top-k emits widened slots (row * count + shard) as int32.
+        if (self.host_row0 + va.host_rows) * self.shard.count >= 2**31:
             raise RuntimeError("HiSparse paged: row indices past int32")
-        log_pages = (coordinator.token_to_kv_pool_allocator.size_full + P) // P + 1
+        log_pages = (coordinator.token_to_kv_pool_allocator.rows_full + P) // P + 1
         self.frame_lp = torch.full(
             (self.num_device_pages,), -1, dtype=torch.int64, device=device
         )  # frame -> logical page

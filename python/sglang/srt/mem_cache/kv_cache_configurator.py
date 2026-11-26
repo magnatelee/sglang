@@ -2498,11 +2498,14 @@ class KVCacheConfigurator:
                 current_platform, subsystem="the HiSparse DSA KV pool"
             )
             PoolCls = HiSparseDSATokenToKVPool
+            from sglang.srt.mem_cache.hisparse_shard import current_shard_view
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
             pool_kwargs["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
+            if current_shard_view().split:
+                pool_kwargs["shard"] = current_shard_view()
         elif dsa_cp_layer_shard_rank is not None:
             reject_out_of_tree_path(
                 current_platform, subsystem="the CP layer-split DSA KV pool"
@@ -2862,10 +2865,14 @@ class KVCacheConfigurator:
             )
             from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
+            from sglang.srt.mem_cache.hisparse_shard import current_shard_view
+
             full_pool_class = HiSparseDSATokenToKVPool
             extra_args["host_to_device_ratio"] = (
                 parse_hisparse_config().host_to_device_ratio
             )
+            if current_shard_view().split:
+                extra_args["hisparse_shard"] = current_shard_view()
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )
@@ -3153,11 +3160,16 @@ class KVCacheConfigurator:
                     )
                 else:
                     if get_memory().enable_hisparse:
+                        from sglang.srt.mem_cache.hisparse_shard import (
+                            current_shard_view,
+                        )
                         from sglang.srt.mem_cache.sparsity import (
                             parse_hisparse_config,
                         )
 
                         hisparse_cfg = parse_hisparse_config()
+                        # Split context: the paged allocator hands out widened slots
+                        # itself (its pool counts this GPU's rows).
                         token_to_kv_pool_allocator = HiSparseTokenToKVPoolAllocator(
                             sizes.max_total_num_tokens,
                             page_size=get_schedule().page_size,
@@ -3166,6 +3178,7 @@ class KVCacheConfigurator:
                             kvcache=token_to_kv_pool,
                             need_sort=need_sort,
                             host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                            shard=current_shard_view(),
                         )
                     elif self.kv_shard_size > 1:
                         # Logical-page sharding: index space widened xN over

@@ -1698,11 +1698,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         if dcp_size > 1:
             # attention reads local KV slots and their counts
+            # Paged HiSparse: where this GPU keeps each page, not the page's logical id.
+            kv_page_table = (
+                block_tables
+                if metadata.resident_page_table is None
+                else metadata.resident_page_table
+            )
             topk_result = dcp_local_topk(
                 logits[:q_offset],
                 seqlens_32_2d.view(-1)[:q_offset],
                 seqlens_32.view(-1)[:q_offset],
-                block_tables,
+                kv_page_table,
                 self.index_topk,
                 page_size,
                 metadata.attn_metadata.topk_v2_plan,
