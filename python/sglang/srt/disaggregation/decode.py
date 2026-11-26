@@ -147,6 +147,7 @@ from sglang.srt.mem_cache.kv.alloc.demand import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv_cache_builder import decode_retraction_max_tokens
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     HybridReqToTokenPool,
     KVCache,
@@ -474,6 +475,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     """
 
     _defer_publish: bool = False
+    # Paged HiSparse receive (SGLANG_HISPARSE_PAGED_PD_RECEIVE): KV lands in device frames.
+    hisparse_resident_receive: bool = False
 
     def __init__(
         self,
@@ -502,6 +505,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.scheduler = scheduler
+        self.hisparse_resident_receive = bool(
+            scheduler.enable_hisparse and envs.SGLANG_HISPARSE_PAGED_PD_RECEIVE.get()
+        )
         self.transfer_queue = transfer_queue
         self.tree_cache = tree_cache
         self.host_pool = None
@@ -626,6 +632,28 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return self._uses_swa_tail_prealloc() or windows_share_owner_memory(
             self.token_to_kv_pool_allocator
         )
+
+    def _check_resident_receive_supported(self) -> None:
+        coordinator = self.scheduler.hisparse_coordinator
+        pool = coordinator.mem_pool_device
+        over_nvlink = (
+            self.transfer_backend == TransferBackend.MOONCAKE
+            and isinstance(pool, HiSparseDSATokenToKVPool)
+            and pool.hs_peer_writable
+            and get_parallel().pp_size == 1
+            and (self.draft_token_to_kv_pool is None or self.draft_kv_ring is not None)
+        )
+        if not (
+            coordinator.hs_resident_only
+            and (over_nvlink or self.transfer_backend == TransferBackend.FAKE)
+        ):
+            raise ValueError(
+                "SGLANG_HISPARSE_PAGED_PD_RECEIVE (a paged HiSparse decode receives KV "
+                "into its device pool over NVLink) needs SGLANG_HISPARSE_PAGED_RESIDENT_ONLY, "
+                "--disaggregation-transfer-backend mooncake with "
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK, no decode pipeline parallelism, "
+                "and no draft KV pool addressed by token (the DFLASH draft ring is fine)."
+            )
 
     def _required_admission_tokens(
         self, req: Req, allocated_tokens: int, prefix_len: int, retractable_tokens: int
@@ -853,17 +881,23 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
         # HiSparse registers its host pool instead; unified memory refuses it.
+        # Paged receive: the device pool's rows, as a decode without HiSparse.
+        direct_to_host = (
+            self.scheduler.enable_hisparse and not self.hisparse_resident_receive
+        )
+        if self.hisparse_resident_receive:
+            self._check_resident_receive_supported()
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             transfer_kv_pool.get_contiguous_buf_infos()
-            if self.scheduler.enable_hisparse
+            if direct_to_host
             else get_kv_transfer_buf_infos(storage)
         )
         kv_data_mem_kinds = (
             ["DRAM"] * len(kv_data_ptrs)
-            if self.scheduler.enable_hisparse
+            if direct_to_host
             else ["VRAM"] * len(kv_data_ptrs)
         )
-        if self.scheduler.enable_hisparse and isinstance(
+        if direct_to_host and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
             device_kv_data_ptrs, device_kv_data_lens, device_kv_item_lens = (
@@ -887,6 +921,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             kv_data_mem_kinds += ["VRAM"] * len(draft_kv_data_ptrs)
             num_draft_entries = len(draft_kv_data_ptrs)
 
+        if self.hisparse_resident_receive:
+            if num_draft_entries:
+                # Draft rows addressed by token would be written at frame ids.
+                raise ValueError(
+                    "SGLANG_HISPARSE_PAGED_PD_RECEIVE: the draft KV pool is addressed "
+                    "by token id; only the DFLASH draft ring is supported."
+                )
+            logger.info(
+                "HiSparse paged receive: %d KV entries of the device pool registered "
+                "as the transfer destination",
+                len(kv_data_ptrs),
+            )
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
@@ -1726,7 +1772,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
         # only transfer_queue reqs are pending device buffer allocation.
         hisparse_req_budget = float("inf")
-        if self.scheduler.enable_hisparse:
+        # Paged receive: no per-request buffer; the allocator's own budget prices the frames.
+        if self.scheduler.enable_hisparse and not self.hisparse_resident_receive:
             coordinator = self.scheduler.hisparse_coordinator
             per_req_device_tokens = (
                 coordinator.padded_buffer_size + coordinator.spec_swap.scratch_capacity
@@ -2269,6 +2316,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         device_page_indices = None
         if (
             self.scheduler.enable_hisparse
+            # Paged receive: one index vector (device frames), as without HiSparse.
+            and not self.hisparse_resident_receive
             and (
                 isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
                 or self.draft_token_to_kv_pool is not None
@@ -2292,6 +2341,26 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     "HiSparse device-only PD transfer currently requires the "
                     "Mooncake backend"
                 )
+            if get_parallel().attn_dcp_size > 1:
+                # The sender reads device indices under a DCP relayout as the
+                # index keys' pages (paged receive); direct-to-host has no such form.
+                raise RuntimeError(
+                    "HiSparse destination device indices are not "
+                    "supported by PD DCP relayout"
+                )
+        if (
+            self.hisparse_resident_receive
+            and get_parallel().attn_dcp_size > 1
+            and not _is_fake_transfer(decode_req.req)
+        ):
+            # A DCP relayout places the token-sharded index keys by the KV rows;
+            # the paged pool keeps them at the logical rows, not at the frames.
+            device_page_indices = kv_to_page_indices(
+                self.req_to_token_pool.req_to_token[
+                    decode_req.req.kv.req_pool_idx, prefix_len:fill_len
+                ],
+                kv_transfer_page_size,
+            ).astype(np.int32)
         metadata_kwargs = {"decode_prefix_len": total_prefix_len}
         if device_page_indices is not None:
             metadata_kwargs["device_kv_indices"] = device_page_indices
@@ -2796,7 +2865,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # The admission prices the reservation beside each request
             # (`ChainAllocator.prealloc_fits`): no scalar is read.
             available_size = 0
-        elif self.scheduler.enable_hisparse:
+        elif self.scheduler.enable_hisparse and not self.hisparse_resident_receive:
             logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
             if self._uses_swa_tail_prealloc() and hasattr(
                 logical_allocator, "full_available_size"
@@ -3044,25 +3113,43 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # this path on the upstream full-allocation semantics.
             assert prefix_len == 0
 
-            # Direct-to-host path: only allocate logical indices (no hisparse
-            # device indices) and allocate host indices for RDMA destination.
             coordinator = self.scheduler.hisparse_coordinator
-            kv_loc = alloc_for_decode_prealloc_hisparse(
-                allocator,
-                req=req,
-                fill_len=fill_len,
-                uses_swa_tail=uses_swa_tail,
-                # HiSparse pools keep one window.
-                swa_tail_len=next(iter(window_tails.values()), fill_len),
-            )
-            # Allocate host indices for the RDMA transfer target.
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.kv.req_pool_idx,
-                0,
-                coordinator.host_token_len(fill_len),
-            )
+            if self.hisparse_resident_receive:
+                # Logical ids and device frames, as a local prefill of this request
+                # gets them; the prefill writes the frames the map names.
+                kv_loc = alloc_for_decode_prealloc_hisparse(
+                    allocator,
+                    req=req,
+                    fill_len=fill_len,
+                    uses_swa_tail=False,
+                    swa_tail_len=fill_len,
+                    resident=True,
+                )
+                if kv_loc is not None:
+                    host_indices = self.token_to_kv_pool_allocator.get_hisparse_kvcache().translate_loc_to_hisparse_device(
+                        kv_loc.to(torch.int64)
+                    )
+                    # The prefill writes these frames on no local stream.
+                    coordinator.wait_frames_quiescent()
+            else:
+                # Direct-to-host path: only allocate logical indices (no hisparse
+                # device indices) and allocate host indices for RDMA destination.
+                kv_loc = alloc_for_decode_prealloc_hisparse(
+                    allocator,
+                    req=req,
+                    fill_len=fill_len,
+                    uses_swa_tail=uses_swa_tail,
+                    # HiSparse pools keep one window.
+                    swa_tail_len=next(iter(window_tails.values()), fill_len),
+                )
+                # Allocate host indices for the RDMA transfer target.
+                host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
+                    coordinator.req_to_host_pool,
+                    coordinator.req_to_host_pool_allocated_len,
+                    req.kv.req_pool_idx,
+                    0,
+                    coordinator.host_token_len(fill_len),
+                )
         else:
             kv_loc = self._alloc_for_decode_prealloc(
                 allocator,
@@ -3121,7 +3208,10 @@ def alloc_for_decode_prealloc_hisparse(
     fill_len: int,
     uses_swa_tail: bool,
     swa_tail_len: int,
+    resident: bool = False,
 ) -> torch.Tensor:
+    """Logical ids for a direct-to-host transfer. `resident` (paged receive): also
+    the device frames, as a local prefill of this request would get them."""
     req.kv.allocate_prealloc(fill_len)
     device = allocator.device
     prefix_lens = async_h2d([0], dtype=torch.int64, device=device)
@@ -3129,6 +3219,15 @@ def alloc_for_decode_prealloc_hisparse(
     seq_lens = async_h2d([fill_len], dtype=torch.int64, device=device)
     seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
     last_loc = async_h2d([-1], dtype=torch.int64, device=device)
+    if resident:
+        return allocator.alloc_extend(
+            prefix_lens=prefix_lens,
+            prefix_lens_cpu=prefix_lens_cpu,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens_cpu,
+            last_loc=last_loc,
+            extend_num_tokens=fill_len,
+        )
     if uses_swa_tail:
         kv_loc = allocator.alloc_extend_swa_tail(
             prefix_lens=prefix_lens,
@@ -4567,9 +4666,16 @@ class SchedulerDisaggregationDecodeMixin:
                 self.waiting_queue
             )
             if self.enable_hisparse:
+                paged_receive = (
+                    self.disagg_decode_prealloc_queue.hisparse_resident_receive
+                )
                 for req in transferred_reqs:
-                    # Direct-to-host: KV data already in host pool, skip staging
-                    self.hisparse_coordinator.admit_request_direct(req)
+                    if paged_receive:
+                        # KV sits in device frames, as after a local prefill.
+                        self.hisparse_coordinator.admit_request_received(req)
+                    else:
+                        # Direct-to-host: KV data already in host pool, skip staging
+                        self.hisparse_coordinator.admit_request_direct(req)
             if get_disagg().disaggregation_decode_host_receive_threshold < 1:
                 # Give completed host transfers device space before new arrivals.
                 self._preallocate_new_requests()

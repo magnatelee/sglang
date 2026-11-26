@@ -272,6 +272,24 @@ def _uses_flat_entry_layout(
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
 
+
+def dcp_index_k_dst_rows(
+    plan,
+    prefill_kv_indices: npt.NDArray[np.int32],
+    dst_index_k_page_indices: Optional[npt.NDArray[np.int32]],
+    **plan_kwargs,
+) -> npt.NDArray[np.int64]:
+    """Destination rows of the token-sharded index keys of a DCP relayout: the KV
+    rows of `plan`, or, for a decode that keeps its index keys at other pages than
+    its KV (paged HiSparse: KV in device frames, keys at the logical rows), the
+    same tokens placed by those pages."""
+    if dst_index_k_page_indices is None:
+        return plan.target_dst_token_indices
+    return build_dcp_token_transfer_plan(
+        prefill_kv_indices, dst_index_k_page_indices, **plan_kwargs
+    ).target_dst_token_indices
+
+
 class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     sender_trace_module = "mooncake"
 
@@ -1699,9 +1717,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: Optional[int] = None,
         draft_rows_collapsed: bool = False,
         dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
+        dst_index_k_page_indices: Optional[npt.NDArray[np.int32]] = None,
     ) -> int:
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
+        if dst_index_k_page_indices is not None and self.kv_args.num_draft_entries:
+            raise RuntimeError(
+                "PD DCP relayout with separate index-key pages does not carry "
+                "draft KV entries addressed by token"
+            )
         physical_page_size = self.kv_args.page_size
 
         if dst_kv_item_lens and len(dst_kv_item_lens) != len(dst_kv_ptrs):
@@ -1774,10 +1798,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 for entry in range(num_target)
             ]
         if dsa_index_k is not None and plan.target_src_token_indices.size:
+            index_k_dst_rows = dcp_index_k_dst_rows(
+                plan,
+                prefill_kv_indices,
+                dst_index_k_page_indices,
+                physical_page_size=physical_page_size,
+                dcp_size=dst_dcp_size,
+                dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
+                draft_rows_collapsed=draft_rows_collapsed,
+            )
             layers_params += self._dsa_index_k_dcp_params(
                 dsa_index_k,
                 plan.target_src_token_indices,
-                plan.target_dst_token_indices,
+                index_k_dst_rows,
                 pack_buffer,
                 pack_offset_bytes=(
                     plan.target_src_token_indices.size
@@ -2958,11 +2994,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                         chunked_dst_device_kv_indice = None
                         if is_dcp_transfer:
-                            if req.dst_device_kv_indices is not None:
-                                raise RuntimeError(
-                                    "HiSparse destination device indices are not "
-                                    "supported by PD DCP relayout"
-                                )
+                            # Whole vectors: the plan slices by token. Device
+                            # indices here are the index keys' own pages (a paged
+                            # HiSparse decode: KV in frames, keys at logical rows).
+                            chunked_dst_device_kv_indice = req.dst_device_kv_indices
                             chunked_dst_kv_indice = req.dst_kv_indices
                         else:
                             chunked_dst_kv_indice = req.dst_kv_indices[
@@ -3035,6 +3070,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dsa_index_k=self.dsa_index_k_dcp_entries(
                                     target_rank_registration_info
                                 ),
+                                dst_index_k_page_indices=chunked_dst_device_kv_indice,
                             )
                         elif (
                             self.is_mla_backend

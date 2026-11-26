@@ -1440,6 +1440,20 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.kv.req_pool_idx] = True
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
+    def admit_request_received(self, req: Req) -> None:
+        """Paged receive (SGLANG_HISPARSE_PAGED_PD_RECEIVE): the prompt arrived by a PD
+        transfer in the device frames its pre-allocation mapped. The request becomes
+        resident at once, in the state `admit_request_into_staging(received=True)` and
+        `move_ready_reqs` leave a local prefill in when nothing is copied to host
+        (exclusive placement, every request resident): no copy, no event to wait for,
+        so every GPU of a split group does this in the same scheduler pass."""
+        rid = req.kv.req_pool_idx
+        self._hs_staged_len[rid] = self.shard.extent(req.extend_end)
+        self.paging.xstats[5] += 1
+        self._make_resident(req)
+        self._skip_first_backup[rid] = True
+        req.hisparse_staging = False
+
     def host_token_len(self, kv_allocated_len: int) -> int:
         if self.is_dsv4_hisparse:
             return kv_allocated_len // self.compress_ratio

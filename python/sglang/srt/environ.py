@@ -865,6 +865,10 @@ class Envs:
     # A request that leaves HiSparse staging under DFLASH gets a DFLASH draft input (as a PD
     # arrival does). Off: only EAGLE-family algorithms can leave staging; DFLASH raises there.
     SGLANG_HISPARSE_DFLASH_STAGING = EnvBool(False)
+    # Needs SGLANG_HISPARSE_PAGED_RESIDENT_ONLY, on a PD decode whose pools are NVLink transfer
+    # targets: a transferred prompt lands in the device frames of the paged pool and the request is
+    # resident on arrival. Off: HiSparse's direct-to-host receive (the host pool is the destination).
+    SGLANG_HISPARSE_PAGED_PD_RECEIVE = EnvBool(False)
     # Split context: every this many decode or verify steps the GPUs of a group compare a digest of
     # their admission ledgers; a difference raises on all of them. 0: off.
     SGLANG_HISPARSE_PAGED_LOCKSTEP_AUDIT = EnvInt(0)
