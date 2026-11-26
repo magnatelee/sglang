@@ -181,15 +181,19 @@ class HiSparseSpecSwapManager:
     # Arbitrary: more blocks than arrivals between two finishes ever need.
     MAX_SPARE_SCRATCH = 16
     _spare_scratch = None  # (class default for managers built without __init__)
+    resident_only = False  # (class default) the buffered swap path exists
 
     def __init__(
         self,
         coordinator: HiSparseCoordinator,
         *,
         num_draft_tokens: int,
+        resident_only: bool = False,
     ) -> None:
         self._coordinator = weakref.proxy(coordinator)
         self.enabled = num_draft_tokens > 0
+        # Resident-only: verify rows are the requests' own pages; no swap tables, no scratch.
+        self.resident_only = resident_only
         self.num_draft_tokens = num_draft_tokens
         self.scratch_capacity = 0
         self._scratch_reqs: set[int] = set()
@@ -206,7 +210,7 @@ class HiSparseSpecSwapManager:
         )
         self.states: tuple[HiSparseSpecState, ...] = ()
         self.top_k_device_locs: Optional[torch.Tensor] = None
-        if not self.enabled:
+        if not self.has_swap_state:
             return
 
         if _is_xpu:
@@ -291,15 +295,20 @@ class HiSparseSpecSwapManager:
         )
 
     @property
+    def has_swap_state(self) -> bool:
+        """Whether the swap tables and per-request scratch of the buffered path exist."""
+        return self.enabled and not self.resident_only
+
+    @property
     def miss_plan_capacity(self) -> int:
         return self._coordinator.top_k * max(1, self.num_draft_tokens)
 
     def invalidate_cache(self, req_pool_idx: int) -> None:
-        if self.enabled:
+        if self.has_swap_state:
             self._cache_index[:, req_pool_idx].fill_(-1)
 
     def reset(self, req_pool_idx: int) -> None:
-        if not self.enabled:
+        if not self.has_swap_state:
             return
         self._cache_index[:, req_pool_idx].fill_(-1)
         self._cache_index[:, req_pool_idx, 0, self._hash_slots] = (
@@ -317,7 +326,7 @@ class HiSparseSpecSwapManager:
 
     def allocate_scratch(self, req_pool_idx: int) -> None:
         """Reserve one request's graph-stable swap workspace at admission."""
-        if not self.enabled or req_pool_idx in self._scratch_reqs:
+        if not self.has_swap_state or req_pool_idx in self._scratch_reqs:
             return
         if self._spare_scratch:
             # Kept by a release on its own stream; this copy is queued behind the batch in flight.
@@ -357,7 +366,7 @@ class HiSparseSpecSwapManager:
 
     def free_unrotated_scratch(self, req_pool_idx: int) -> None:
         """Free scratch before any swap kernel has changed its ownership."""
-        if not self.enabled or req_pool_idx not in self._scratch_reqs:
+        if not self.has_swap_state or req_pool_idx not in self._scratch_reqs:
             return
         if (
             self._spare_scratch is not None
@@ -400,7 +409,7 @@ class HiSparseSpecSwapManager:
             self._spare_scratch.clear()
 
     def clear_scratch(self, req_pool_idx: int) -> None:
-        if not self.enabled or req_pool_idx not in self._scratch_reqs:
+        if not self.has_swap_state or req_pool_idx not in self._scratch_reqs:
             return
         self.req_to_scratch[:, req_pool_idx].zero_()
         self._scratch_reqs.remove(req_pool_idx)
@@ -408,7 +417,7 @@ class HiSparseSpecSwapManager:
     def extend_owned_locs(
         self, req_pool_idx: int, owned_locs: torch.Tensor
     ) -> torch.Tensor:
-        if not self.enabled or req_pool_idx not in self._scratch_reqs:
+        if not self.has_swap_state or req_pool_idx not in self._scratch_reqs:
             return owned_locs
         return torch.cat([owned_locs, self.req_to_scratch[:, req_pool_idx].reshape(-1)])
 
@@ -421,6 +430,15 @@ class HiSparseSpecSwapManager:
 
         if not self.enabled:
             raise RuntimeError("HiSparse spec is not initialized.")
+        if self.resident_only:
+            # Every request writes its verify KV to its own mirrored pages.
+            res_rows = coordinator._hs_spec_res_prepare(batch)
+            if len(res_rows) != len(batch.reqs):
+                raise RuntimeError(
+                    "HiSparse resident-only: a verify batch holds a request that is not resident"
+                )
+            coordinator._hs_verify_sel = len(batch.reqs)
+            return
         if self.num_draft_tokens > coordinator.page_size - 1:
             raise ValueError(
                 f"HiSparse spec needs {self.num_draft_tokens} verify slots, but the "
@@ -569,6 +587,10 @@ class HiSparseSpecSwapManager:
                 # A resident request's accepted KV is already in its own slots;
                 # it is copied to host when its page leaves the device pool.
                 return
+            if self.resident_only:
+                raise RuntimeError(
+                    "HiSparse resident-only: a verify batch holds a request that is not resident"
+                )
             if res_rows:
                 rs = set(res_rows)
                 buf_rows = [i for i in range(len(reqs)) if i not in rs]
@@ -727,6 +749,7 @@ class HiSparseCoordinator:
     enable_resident = False
     hs_exclusive = False
     hs_short_resident = False  # (class default) no request is kept in a hot buffer
+    hs_resident_only = False  # (class default) nothing of the buffered path is built
     hs_host_scarce = False
     paging = None
     _resident = types.MappingProxyType({})
@@ -924,9 +947,12 @@ class HiSparseCoordinator:
             .repeat(layer_num, max_num_req_slots, 1)
             .contiguous()
         )
+        # Resident-only: no request is ever buffered, so the speculative swap keeps no state.
+        self.hs_resident_only = bool(envs.SGLANG_HISPARSE_PAGED_RESIDENT_ONLY.get())
         self.spec_swap = HiSparseSpecSwapManager(
             self,
             num_draft_tokens=num_draft_tokens,
+            resident_only=self.hs_resident_only,
         )
         if isinstance(self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
             self.token_to_kv_pool_allocator.configure_spec_scratch(
@@ -978,6 +1004,11 @@ class HiSparseCoordinator:
             raise ValueError(
                 "SGLANG_HISPARSE_PAGED_SHORT_RESIDENT needs SGLANG_HISPARSE_PAGED "
                 "and SGLANG_HISPARSE_PAGED_EXCLUSIVE."
+            )
+        if self.hs_resident_only and not self.hs_short_resident:
+            raise ValueError(
+                "SGLANG_HISPARSE_PAGED_RESIDENT_ONLY needs SGLANG_HISPARSE_PAGED, "
+                "SGLANG_HISPARSE_PAGED_EXCLUSIVE and SGLANG_HISPARSE_PAGED_SHORT_RESIDENT."
             )
         if self.hs_short_resident and isinstance(
             self.token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
@@ -1552,19 +1583,24 @@ class HiSparseCoordinator:
         rpi = tuple(int(r) for r in req_pool_indices_cpu.tolist())
         self._hs_pt_batch = None
         if not rpi or any(r not in self._resident for r in rpi):
+            if rpi and self.hs_resident_only:
+                raise RuntimeError(
+                    "HiSparse resident-only: a decode batch holds a request that is not resident"
+                )
             return
         self._hs_pt_batch = rpi
         self._hs_pt_seq = tuple(int(x) for x in seq_lens_cpu.tolist())
 
-    def resident_page_table(self, attn_metadata) -> Optional[torch.Tensor]:
+    def resident_page_table(
+        self, attn_metadata, *, decode_shaped: bool
+    ) -> Optional[torch.Tensor]:
         """While the all-resident decode graph is captured: the page table its top-k
         maps selected positions through. None in every other forward.
 
         Built inside the graph from the forward's own page table and the allocator's
         map, by the first indexer layer of the forward; the others reuse it."""
-        if (
-            not self.enable_resident
-            or get_capture_attention_variant() != HISPARSE_RESIDENT
+        if not self.enable_resident or not self.resident_variant_active(
+            decode_shaped=decode_shaped
         ):
             return None
         page_table = attn_metadata.real_page_table
@@ -1586,6 +1622,13 @@ class HiSparseCoordinator:
         )
         self._hs_pt_memo = (key, table)
         return table
+
+    def resident_variant_active(self, *, decode_shaped: bool) -> bool:
+        """Whether this forward takes the all-resident path: its graph is being captured, or
+        (resident-only) it is a decode or verify forward, which then has no other path."""
+        if get_capture_attention_variant() == HISPARSE_RESIDENT:
+            return True
+        return self.hs_resident_only and decode_shaped
 
     def hs_batch_all_resident(self, forward_batch) -> bool:
         """The graph-variant choice: every request resident, and the page table built for exactly this batch."""
@@ -2914,7 +2957,7 @@ class HiSparseCoordinator:
         if (
             self.enable_resident
             and top_k_result.ndim in (2, 3)
-            and get_capture_attention_variant() == HISPARSE_RESIDENT
+            and self.resident_variant_active(decode_shaped=True)
         ):
             # The all-resident graph's top-k already emitted the rows to read.
             return top_k_result

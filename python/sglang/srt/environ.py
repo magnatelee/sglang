@@ -855,6 +855,10 @@ class Envs:
     # arrival like every longer one (it keeps its prefill pages and gets no hot buffer), so no request is
     # buffered and every decode replay is the all-resident graph. Off: such a prompt lives in a hot buffer.
     SGLANG_HISPARSE_PAGED_SHORT_RESIDENT = EnvBool(False)
+    # Needs SGLANG_HISPARSE_PAGED_SHORT_RESIDENT (no request is buffered): only the all-resident decode
+    # graph is captured, a decode step without a graph takes that path too, and the speculative swap
+    # keeps no tables and no scratch, so a request is not charged a scratch block.
+    SGLANG_HISPARSE_PAGED_RESIDENT_ONLY = EnvBool(False)
     # Decode-step changes, each off by default (off = the paths as they were):
     # WLOC_ONCE: a forward's write locations are translated to device slots by the first layer that
     # writes and reused by the others (one kernel per forward instead of one per layer).

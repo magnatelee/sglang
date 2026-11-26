@@ -9,11 +9,7 @@ import torch
 
 from sglang.kernels.ops.kvcache import hisparse_paging as paging_kernels
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.graph_variants import HISPARSE_RESIDENT
 from sglang.srt.mem_cache.stream_handoff import handed_over, staged
-from sglang.srt.model_executor.runner_utils.capture_mode import (
-    get_capture_attention_variant,
-)
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -1346,7 +1342,7 @@ class HiSparsePagingManager:
         coordinator = self._coordinator
         if not self._rc_rows or red.ndim not in (2, 3):
             return red
-        if get_capture_attention_variant() != HISPARSE_RESIDENT:
+        if not coordinator.resident_variant_active(decode_shaped=True):
             return red
         memo = self._rc_memo
         if coordinator._is_shared_index_layer[layer_id]:
@@ -1470,7 +1466,7 @@ class HiSparsePagingManager:
             and src.ndim in (2, 3)
             and src.numel() > 0
             and not coordinator._is_shared_index_layer[layer_id]
-            and get_capture_attention_variant() == HISPARSE_RESIDENT
+            and coordinator.resident_variant_active(decode_shaped=True)
         ):
             # the plan that read_through_row_cache makes of this table starts here: its stamp, and
             # the hits marked by the redirect's kernel

@@ -81,11 +81,17 @@ class HiSparseResidentGraphVariants(msgspec.Struct, frozen=True):
 
     @property
     def capture_labels(self) -> tuple[str, ...]:
+        if self.coordinator.hs_resident_only:
+            return (HISPARSE_RESIDENT,)
         # Mixed first: its capture peak (the swap-in workspaces) subsumes the
         # resident graph's in the shared pool.
         return (HISPARSE_MIXED, HISPARSE_RESIDENT)
 
     def select(self, forward_batch: ForwardBatch) -> str:
+        if self.coordinator.hs_resident_only:
+            # Counted like every other choice; nothing but the resident graph exists.
+            self.coordinator.hs_batch_all_resident(forward_batch)
+            return HISPARSE_RESIDENT
         if self.coordinator.hs_batch_all_resident(forward_batch):
             return HISPARSE_RESIDENT
         return HISPARSE_MIXED

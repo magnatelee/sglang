@@ -5083,12 +5083,12 @@ class DeepseekSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
+        decode_shaped = (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+        )
         force_unfused = not self.use_fused_topk or (
-            self.hisparse_coordinator is not None
-            and (
-                forward_batch.forward_mode.is_decode_or_idle()
-                or forward_batch.forward_mode.is_target_verify()
-            )
+            self.hisparse_coordinator is not None and decode_shaped
         )
         return DSAIndexerMetadata(
             indexer_page_table=self.forward_metadata.indexer_page_table,
@@ -5103,7 +5103,9 @@ class DeepseekSparseAttnBackend(
             packed_extend_topk=self.dsa_packed_extend_topk,
             dcp_size=1 if self.dsa_shards_index_k else self.attn_dcp_size,
             resident_page_table=(
-                self.hisparse_coordinator.resident_page_table(self.forward_metadata)
+                self.hisparse_coordinator.resident_page_table(
+                    self.forward_metadata, decode_shaped=decode_shaped
+                )
                 if self.hisparse_coordinator is not None
                 else None
             ),
