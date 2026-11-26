@@ -523,9 +523,18 @@ class FutureMap:
             device=self.device,
         )
 
-    def make_staged_spec_input(self, future_indices: torch.Tensor):
-        """Build the relay handle for a request leaving HiSparse staging."""
+    def make_staged_spec_input(
+        self,
+        future_indices: torch.Tensor,
+        *,
+        bonus_tokens: Optional[torch.Tensor] = None,
+        seq_lens: Optional[torch.Tensor] = None,
+    ):
+        """Build the relay handle for a request leaving HiSparse staging.
+        bonus_tokens, seq_lens: the batch's last tokens and lengths (DFLASH needs them)."""
         self.flush_deferred_relay()
+        if self.spec_algo.is_dflash() and envs.SGLANG_HISPARSE_DFLASH_STAGING.get():
+            return self._make_staged_dflash_input(future_indices, bonus_tokens, seq_lens)
         if not (self.spec_algo.is_eagle() or self.spec_algo.is_standalone()):
             raise RuntimeError(
                 "HiSparse staging only supports EAGLE-family speculative inputs."
@@ -543,6 +552,21 @@ class FutureMap:
             future_indices=future_indices,
             future_dsa_topk_indices_available=(self.dsa_topk_indices_buf is not None),
         )
+
+    def _make_staged_dflash_input(
+        self,
+        future_indices: torch.Tensor,
+        bonus_tokens: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        """What a PD decode builds for an arriving DFLASH request
+        (build_dflash_disagg_draft_input): the caller stashed the bonus tokens."""
+        from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+
+        spec_info = make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=seq_lens)
+        spec_info.future_indices = future_indices
+        self.publish(future_indices, seq_lens)
+        return spec_info
 
     def resolve_confidence_cpu(
         self, batch: ScheduleBatch

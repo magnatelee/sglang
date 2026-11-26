@@ -4263,7 +4263,9 @@ class Scheduler(
 
         if not batch.spec_algorithm.is_none():
             batch.spec_info = self.future_map.make_staged_spec_input(
-                batch.req_pool_indices
+                batch.req_pool_indices,
+                bonus_tokens=last_tokens,
+                seq_lens=batch.seq_lens,
             )
 
         if batch.return_logprob:
