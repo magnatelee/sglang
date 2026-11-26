@@ -732,6 +732,7 @@ class HiSparseCoordinator:
     _resident = types.MappingProxyType({})
     _resident_steps = 0
     _release_queue = None  # (class default)
+    _pool_layer_index = None  # (class default) model layer id -> pool layer; None: the same
 
     def __init__(
         self,
@@ -961,7 +962,7 @@ class HiSparseCoordinator:
         if self.enable_resident and not self._hs_unified:
             raise ValueError(
                 "SGLANG_HISPARSE_PAGED needs the DSA HiSparse pool on its mapped "
-                "address range (not DeepSeek V4, MiniMax or a hybrid-linear pool)."
+                "address range (not DeepSeek V4 or MiniMax)."
             )
         # Exclusive placement: a page in the device pool holds a host slot only
         # until the slot is needed, so the logical pool may exceed the host pool.
@@ -1002,11 +1003,10 @@ class HiSparseCoordinator:
             else None
         )
         if self.enable_resident and self.hs_el is None:
-            # A wrapper pool (hybrid-linear) hides the inner pool's ranges from the
-            # allocator, which would then never grow them.
+            # An allocator that does not see the pool's ranges would never grow them.
             raise ValueError(
-                "SGLANG_HISPARSE_PAGED needs the allocator to hold the DSA HiSparse "
-                "pool itself, not a wrapper around it."
+                "SGLANG_HISPARSE_PAGED needs an allocator that holds the DSA HiSparse "
+                "pool's mapped ranges."
             )
         self.hs_el_stats = [
             0,
@@ -2885,9 +2885,18 @@ class HiSparseCoordinator:
             req_pool_indices, compressed_seq_lens, top_k_result, layer_id
         )
         if self.enable_resident:
-            locs = self.paging.redirect(locs, layer_id)
-            locs = self.paging.read_through_row_cache(locs, layer_id)
+            # The paging tables are indexed by the pool's layers.
+            pool_layer = self.pool_layer_of(layer_id)
+            locs = self.paging.redirect(locs, pool_layer)
+            locs = self.paging.read_through_row_cache(locs, pool_layer)
         return locs
+
+    def pool_layer_of(self, layer_id: int) -> int:
+        """The KV pool's layer for a model layer id (a hybrid-linear model keeps
+        only its full-attention layers in the pool)."""
+        if self._pool_layer_index is None:
+            return layer_id
+        return self._pool_layer_index[layer_id]
 
     def _hs_swap_in_selected_pages(
         self,
@@ -2901,8 +2910,7 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
-        if self._pool_layer_index is not None:
-            layer_id = self._pool_layer_index[layer_id]
+        layer_id = self.pool_layer_of(layer_id)
         if (
             self.enable_resident
             and top_k_result.ndim in (2, 3)

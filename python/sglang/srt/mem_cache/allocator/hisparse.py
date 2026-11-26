@@ -64,8 +64,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             kvcache,
             need_sort,
         )
-        # the device allocator spans the band too; only mapped pages are handed out
-        self._hs_el = getattr(kvcache, "_hs_el", None)
+        # the device allocator spans the band too; only mapped pages are handed out.
+        # A hybrid-linear model keeps its DSA layers in an inner pool: the ranges are there.
+        self._hs_el = getattr(self.get_hisparse_kvcache(), "_hs_el", None)
         self.hisparse_attn_allocator = paged_allocator_cls(
             self._hs_el["k_max"] if self._hs_el else self._size_hisparse,
             self.page_size,
@@ -372,7 +373,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def hs_copy_rows(self, src: torch.Tensor, dst: torch.Tensor) -> None:
         """copy device rows src -> dst in every layer."""
-        for buf in self._kvcache.kv_buffer:
+        for buf in self.get_hisparse_kvcache().kv_buffer:
             buf[dst] = buf[src]
 
     def get_kvcache(self):

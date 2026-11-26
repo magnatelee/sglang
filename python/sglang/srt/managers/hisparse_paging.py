@@ -280,6 +280,11 @@ class HiSparsePagingManager:
         self._rc_premarked = None
         self.rc_plans = [0, 0]  # plans whose hits the redirect's kernel marked, plans that marked themselves
         rc = max(0, int(envs.SGLANG_HISPARSE_PAGED_ROWCACHE_ROWS.get()))
+        if rc and not coordinator.enable_prefetch:
+            logger.warning(
+                "HiSparse paged: SGLANG_HISPARSE_PAGED_ROWCACHE_ROWS is ignored: the host-row cache "
+                "needs layers that share a selection, and this model has none."
+            )
         if rc and coordinator.enable_prefetch:
             if rc & (rc - 1) or rc < 1024:
                 raise RuntimeError(
